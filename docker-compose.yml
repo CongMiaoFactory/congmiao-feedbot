@@ -23,6 +23,20 @@ services:
       ENABLE_GENERAL_UNBLOCK: ${NETEASE_ENABLE_GENERAL_UNBLOCK:-true}
       ENABLE_FLAC: ${NETEASE_ENABLE_FLAC:-true}
 
+  telegram-bot-api:
+    image: ${TELEGRAM_BOT_API_IMAGE:-aiogram/telegram-bot-api:latest}
+    restart: unless-stopped
+    profiles: ["telegram-local"]
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_HTTP_PORT: "8081"
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    ports:
+      - "127.0.0.1:${TELEGRAM_API_PORT:-8081}:8081"
+
   redis:
     image: redis:8-alpine
     restart: unless-stopped
@@ -34,3 +48,4 @@ services:
 volumes:
   feedbot-data:
   redis-data:
+  telegram-bot-api-data:

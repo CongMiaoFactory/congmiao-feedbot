@@ -78,6 +78,28 @@ docker compose --profile redis up -d
 
 Compose 会自动启动网易云 API sidecar，并在容器内将 `NETEASE_API_BASE` 设为 `http://netease-api:3000`。可通过 `NETEASE_API_IMAGE` 覆盖 sidecar 镜像。
 
+### 在 Compose 中启用本地 Telegram Bot API
+
+先到 [my.telegram.org/apps](https://my.telegram.org/apps) 创建应用，取得 `api_id` 和 `api_hash`，然后修改 `.env`：
+
+```env
+TELEGRAM_BOT_TOKEN=从BotFather取得的BotToken
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=你的api_hash
+TELEGRAM_API_URL=http://telegram-bot-api:8081
+LOCAL_MODE=true
+```
+
+使用 `telegram-local` profile 启动：
+
+```bash
+docker compose --profile telegram-local pull
+docker compose --profile telegram-local up -d
+docker compose logs -f telegram-bot-api feedbot
+```
+
+`telegram-bot-api` 仅将 `8081` 端口绑定到宿主机的 `127.0.0.1`，feedbot 通过 Compose 内部服务名访问。数据保存在 `telegram-bot-api-data` volume。恢复官方 Telegram Bot API 时，清空 `TELEGRAM_API_URL`、设置 `LOCAL_MODE=false`，再执行普通的 `docker compose up -d`。
+
 ## Linux x64 Release 启动
 
 GitHub Release 提供静态链接的 `x86_64-unknown-linux-musl` 程序。运行时仍需要 FFmpeg 和 yt-dlp。
