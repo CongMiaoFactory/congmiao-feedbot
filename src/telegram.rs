@@ -12,7 +12,8 @@ use teloxide::{
         FileId, InlineQueryResult, InlineQueryResultArticle, InlineQueryResultCachedAudio,
         InlineQueryResultCachedPhoto, InlineQueryResultCachedVideo, InlineQueryResultPhoto,
         InlineQueryResultVideo, InputFile, InputMedia, InputMediaPhoto, InputMediaVideo,
-        InputMessageContent, InputMessageContentText, MessageEntityKind, ParseMode,
+        InputMessageContent, InputMessageContentText, MessageEntityKind, MessageId, ParseMode,
+        ReplyParameters,
     },
 };
 use tokio::sync::Semaphore;
@@ -319,6 +320,7 @@ async fn send_content(
     let spoiler = media_has_spoiler(&state.config, &content);
     if content.media.is_empty() {
         bot.send_message(msg.chat.id, caption(&content, 4096))
+            .reply_parameters(ReplyParameters::new(msg.id))
             .parse_mode(ParseMode::Html)
             .await?;
         return Ok(());
@@ -336,12 +338,14 @@ async fn send_content(
     if selected.is_empty() {
         if let Some(url) = content.media.iter().find_map(|m| m.thumbnail_url.clone()) {
             bot.send_photo(msg.chat.id, InputFile::url(url.parse()?))
+                .reply_parameters(ReplyParameters::new(msg.id))
                 .has_spoiler(spoiler)
                 .caption(caption_text)
                 .parse_mode(ParseMode::Html)
                 .await?;
         } else {
             bot.send_message(msg.chat.id, caption_text)
+                .reply_parameters(ReplyParameters::new(msg.id))
                 .parse_mode(ParseMode::Html)
                 .await?;
         }
@@ -387,7 +391,10 @@ async fn send_content(
                     }
                 });
             }
-            let sent = bot.send_media_group(msg.chat.id, group).await?;
+            let sent = bot
+                .send_media_group(msg.chat.id, group)
+                .reply_parameters(ReplyParameters::new(msg.id))
+                .await?;
             for ((item, message), prep) in chunk.iter().zip(sent.iter()).zip(
                 prepared
                     .into_iter()
@@ -411,11 +418,16 @@ async fn send_content(
         {
             send_cached(
                 bot,
-                msg.chat.id,
                 item,
                 file_id,
-                if index == 0 { &caption_text } else { "" },
-                spoiler,
+                SendOptions {
+                    chat: msg.chat.id,
+                    caption: if index == 0 { &caption_text } else { "" },
+                    spoiler,
+                    reply_to: msg.id,
+                    title: &content.title,
+                    performer: &content.author.name,
+                },
             )
             .await?;
             continue;
@@ -428,12 +440,17 @@ async fn send_content(
             Ok(p) => {
                 send_local(
                     bot,
-                    msg.chat.id,
                     item,
                     &p.path,
-                    if index == 0 { &caption_text } else { "" },
                     options.file_mode,
-                    spoiler,
+                    SendOptions {
+                        chat: msg.chat.id,
+                        caption: if index == 0 { &caption_text } else { "" },
+                        spoiler,
+                        reply_to: msg.id,
+                        title: &content.title,
+                        performer: &content.author.name,
+                    },
                 )
                 .await?
             }
@@ -442,12 +459,14 @@ async fn send_content(
                 if index == 0 {
                     if let Some(thumbnail) = &item.thumbnail_url {
                         bot.send_photo(msg.chat.id, InputFile::url(thumbnail.parse()?))
+                            .reply_parameters(ReplyParameters::new(msg.id))
                             .has_spoiler(spoiler)
                             .caption(&caption_text)
                             .parse_mode(ParseMode::Html)
                             .await?
                     } else {
                         bot.send_message(msg.chat.id, &caption_text)
+                            .reply_parameters(ReplyParameters::new(msg.id))
                             .parse_mode(ParseMode::Html)
                             .await?
                     }
@@ -487,20 +506,37 @@ async fn input_for_item(
     Ok(input)
 }
 
+#[derive(Clone, Copy)]
+struct SendOptions<'a> {
+    chat: ChatId,
+    caption: &'a str,
+    spoiler: bool,
+    reply_to: MessageId,
+    title: &'a str,
+    performer: &'a str,
+}
+
 async fn send_local(
     bot: &Bot,
-    chat: ChatId,
     item: &MediaItem,
     path: &std::path::Path,
-    caption: &str,
     document: bool,
-    spoiler: bool,
+    options: SendOptions<'_>,
 ) -> Result<Message> {
+    let SendOptions {
+        chat,
+        caption,
+        spoiler,
+        reply_to,
+        title,
+        performer,
+    } = options;
     let input = InputFile::file(path.to_path_buf()).file_name(item.filename.clone());
     // Telegram documents cannot carry a spoiler. Sensitive visual media stays
     // photo/video/animation even when /file was requested.
     let req = if (document && !spoiler) || item.kind == MediaKind::Document {
         bot.send_document(chat, input)
+            .reply_parameters(ReplyParameters::new(reply_to))
             .caption(caption)
             .parse_mode(ParseMode::Html)
             .await?
@@ -508,6 +544,7 @@ async fn send_local(
         match item.kind {
             MediaKind::Photo => {
                 bot.send_photo(chat, input)
+                    .reply_parameters(ReplyParameters::new(reply_to))
                     .has_spoiler(spoiler)
                     .caption(caption)
                     .parse_mode(ParseMode::Html)
@@ -515,6 +552,7 @@ async fn send_local(
             }
             MediaKind::Video => {
                 bot.send_video(chat, input)
+                    .reply_parameters(ReplyParameters::new(reply_to))
                     .has_spoiler(spoiler)
                     .caption(caption)
                     .parse_mode(ParseMode::Html)
@@ -523,12 +561,16 @@ async fn send_local(
             }
             MediaKind::Audio => {
                 bot.send_audio(chat, input)
+                    .reply_parameters(ReplyParameters::new(reply_to))
+                    .title(title)
+                    .performer(performer)
                     .caption(caption)
                     .parse_mode(ParseMode::Html)
                     .await?
             }
             MediaKind::Animation => {
                 bot.send_animation(chat, input)
+                    .reply_parameters(ReplyParameters::new(reply_to))
                     .has_spoiler(spoiler)
                     .caption(caption)
                     .parse_mode(ParseMode::Html)
@@ -542,16 +584,23 @@ async fn send_local(
 
 async fn send_cached(
     bot: &Bot,
-    chat: ChatId,
     item: &MediaItem,
     id: String,
-    caption: &str,
-    spoiler: bool,
+    options: SendOptions<'_>,
 ) -> Result<Message> {
+    let SendOptions {
+        chat,
+        caption,
+        spoiler,
+        reply_to,
+        title,
+        performer,
+    } = options;
     let input = InputFile::file_id(teloxide::types::FileId(id));
     Ok(match item.kind {
         MediaKind::Photo => {
             bot.send_photo(chat, input)
+                .reply_parameters(ReplyParameters::new(reply_to))
                 .has_spoiler(spoiler)
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
@@ -559,6 +608,7 @@ async fn send_cached(
         }
         MediaKind::Video => {
             bot.send_video(chat, input)
+                .reply_parameters(ReplyParameters::new(reply_to))
                 .has_spoiler(spoiler)
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
@@ -566,12 +616,16 @@ async fn send_cached(
         }
         MediaKind::Audio => {
             bot.send_audio(chat, input)
+                .reply_parameters(ReplyParameters::new(reply_to))
+                .title(title)
+                .performer(performer)
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?
         }
         MediaKind::Animation => {
             bot.send_animation(chat, input)
+                .reply_parameters(ReplyParameters::new(reply_to))
                 .has_spoiler(spoiler)
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
@@ -579,6 +633,7 @@ async fn send_cached(
         }
         MediaKind::Document => {
             bot.send_document(chat, input)
+                .reply_parameters(ReplyParameters::new(reply_to))
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?

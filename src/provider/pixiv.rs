@@ -266,7 +266,11 @@ impl Provider for PixivProvider {
             .and_then(Value::as_array)
             .map(|a| {
                 a.iter()
-                    .filter_map(|v| v.as_str().or_else(|| v.get("tag").and_then(Value::as_str)))
+                    .filter_map(|v| {
+                        v.as_str()
+                            .or_else(|| v.get("tag").and_then(Value::as_str))
+                            .or_else(|| v.get("name").and_then(Value::as_str))
+                    })
                     .map(|s| format!("#{s}"))
                     .collect::<Vec<_>>()
                     .join(" ")

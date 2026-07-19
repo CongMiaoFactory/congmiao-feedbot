@@ -140,6 +140,8 @@ impl Provider for NeteaseProvider {
                     })
                     .unwrap_or_default();
                 let cover = get_str(song, "/al/picUrl").map(str::to_string);
+                let title = get_str(song, "/name").unwrap_or_default().to_string();
+                let audio_format = get_str(&audio, "/data/0/type").unwrap_or("mp3");
                 Ok(ParsedContent {
                     platform: Platform::Netease,
                     kind: ContentKind::Audio,
@@ -151,7 +153,7 @@ impl Provider for NeteaseProvider {
                         url: None,
                         avatar_url: None,
                     },
-                    title: get_str(song, "/name").unwrap_or_default().into(),
+                    title: title.clone(),
                     text: get_str(song, "/al/name").unwrap_or_default().into(),
                     sensitive: false,
                     stats: Default::default(),
@@ -159,12 +161,12 @@ impl Provider for NeteaseProvider {
                         kind: MediaKind::Audio,
                         source_url: media_url.into(),
                         thumbnail_url: cover,
-                        filename: format!("netease-{id}.mp3"),
-                        mime_type: Some(
-                            get_str(&audio, "/data/0/type")
-                                .map(|t| format!("audio/{t}"))
-                                .unwrap_or_else(|| "audio/mpeg".into()),
-                        ),
+                        filename: song_filename(&title, &id, audio_format),
+                        mime_type: Some(if audio_format == "mp3" {
+                            "audio/mpeg".into()
+                        } else {
+                            format!("audio/{audio_format}")
+                        }),
                         duration_secs: get_u64(song, "/dt").map(|n| n / 1000),
                         width: None,
                         height: None,
@@ -242,6 +244,30 @@ impl Provider for NeteaseProvider {
             }
         }
     }
+}
+
+fn song_filename(title: &str, id: &str, format: &str) -> String {
+    let mut safe = title
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .take(120)
+        .collect::<String>();
+    safe = safe.trim_matches([' ', '.']).to_string();
+    if safe.is_empty() {
+        safe = format!("netease-{id}");
+    }
+    let extension = match format.to_ascii_lowercase().as_str() {
+        "mp3" | "flac" | "m4a" | "aac" | "ogg" | "opus" => format.to_ascii_lowercase(),
+        _ => "mp3".into(),
+    };
+    format!("{safe}.{extension}")
 }
 
 impl NeteaseProvider {

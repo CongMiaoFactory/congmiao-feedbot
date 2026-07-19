@@ -131,7 +131,7 @@ async fn x_provider_deserializes_post_and_media() {
 async fn pixiv_provider_supports_multiple_pages() {
     let server = MockServer::start().await;
     Mock::given(method("GET")).and(path("/ajax/illust/123")).and(query_param("lang", "zh"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":{"title":"work","userId":"5","userName":"Artist","pageCount":2,"xRestrict":1,"tags":{"tags":[{"tag":"R-18"}]}}}))).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":{"title":"work","userId":"5","userName":"Artist","pageCount":2,"xRestrict":1,"tags":{"tags":[{"name":"R-18"},{"tag":"插画"}]}}}))).mount(&server).await;
     Mock::given(method("GET")).and(path("/ajax/illust/123/pages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":[{"urls":{"original":"https://i.pximg.net/1.jpg"}},{"urls":{"original":"https://i.pximg.net/2.jpg"}}]}))).mount(&server).await;
     let mut c = config();
@@ -146,6 +146,7 @@ async fn pixiv_provider_supports_multiple_pages() {
     assert_eq!(parsed.media.len(), 2);
     assert_eq!(parsed.author.name, "Artist");
     assert!(parsed.text.contains("#R-18"));
+    assert!(parsed.text.contains("#插画"));
     assert!(parsed.sensitive);
     assert!(media_has_spoiler(&c, &parsed));
 }
@@ -229,6 +230,7 @@ async fn netease_provider_parses_song_through_sidecar() {
     assert_eq!(parsed.title, "Song");
     assert_eq!(parsed.author.name, "Singer");
     assert_eq!(parsed.media.len(), 1);
+    assert_eq!(parsed.media[0].filename, "Song.mp3");
 }
 
 #[tokio::test]
