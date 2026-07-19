@@ -1,0 +1,37 @@
+services:
+  feedbot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NETEASE_API_BASE: http://netease-api:3000
+      REDIS_URL: ${REDIS_URL:-}
+    volumes:
+      - feedbot-data:/app/data
+      - ./secrets:/app/secrets:ro
+    depends_on:
+      netease-api:
+        condition: service_started
+    ports:
+      - "${WEBHOOK_PORT:-8080}:${WEBHOOK_PORT:-8080}"
+
+  netease-api:
+    image: ${NETEASE_API_IMAGE:-moefurina/ncm-api:latest}
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      ENABLE_GENERAL_UNBLOCK: ${NETEASE_ENABLE_GENERAL_UNBLOCK:-true}
+      ENABLE_FLAC: ${NETEASE_ENABLE_FLAC:-true}
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    profiles: ["redis"]
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+volumes:
+  feedbot-data:
+  redis-data:
+

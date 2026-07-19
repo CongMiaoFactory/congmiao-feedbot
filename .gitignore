@@ -1,0 +1,42 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Runtime data and temporary media
+/data/
+/tmp/
+/logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+/secrets/
+*cookies*.txt
+*.session
+
+# Coverage and profiling output
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local agent metadata
+/.agents/
+/.codex/
+
+# Upstream Python reference checkout; the Rust implementation is standalone.
+/telegram-bili-feed-helper/
