@@ -88,6 +88,7 @@ TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH=你的api_hash
 TELEGRAM_API_URL=http://telegram-bot-api:8081
 LOCAL_MODE=true
+TELEGRAM_REQUEST_TIMEOUT_SECS=600
 ```
 
 使用 `telegram-local` profile 启动：
@@ -100,6 +101,8 @@ docker compose logs -f telegram-bot-api feedbot
 
 `telegram-bot-api` 仅将 `8081` 端口绑定到宿主机的 `127.0.0.1`，feedbot 通过 Compose 内部服务名访问。数据保存在 `telegram-bot-api-data` volume。恢复官方 Telegram Bot API 时，清空 `TELEGRAM_API_URL`、设置 `LOCAL_MODE=false`，再执行普通的 `docker compose up -d`。
 
+本地 Bot API 处理大媒体时可能超过 teloxide 默认的短请求时限，项目默认将 Telegram 请求超时设为 600 秒，可用 `TELEGRAM_REQUEST_TIMEOUT_SECS` 调整。
+
 ## Linux x64 Release 启动
 
 GitHub Release 提供静态链接的 `x86_64-unknown-linux-musl` 程序。运行时仍需要 FFmpeg 和 yt-dlp。
@@ -109,7 +112,7 @@ sudo apt-get update
 sudo apt-get install -y ffmpeg python3 python3-pip curl
 sudo pip3 install --break-system-packages -U yt-dlp
 
-VERSION=v0.2.1
+VERSION=v0.2.2
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"

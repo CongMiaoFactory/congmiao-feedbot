@@ -40,7 +40,18 @@ pub struct BotState {
 }
 
 pub async fn run(state: BotState) -> Result<()> {
-    let mut bot = Bot::new(&state.config.telegram_token);
+    // teloxide's default HTTP timeout is intentionally short (17 seconds),
+    // which is insufficient when a local Bot API waits for Telegram to finish
+    // processing a large multipart upload. A timed-out request may still have
+    // delivered the media and then be reported as a network failure.
+    let telegram_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(
+            state.config.telegram_request_timeout_secs,
+        ))
+        .tcp_nodelay(true)
+        .build()?;
+    let mut bot = Bot::with_client(&state.config.telegram_token, telegram_client);
     if let Some(api) = &state.config.telegram_api_url {
         bot = bot.set_api_url(url::Url::parse(api)?);
     }
@@ -52,7 +63,11 @@ pub async fn run(state: BotState) -> Result<()> {
         .dependencies(dptree::deps![state.clone()])
         .enable_ctrlc_handler()
         .build();
-    info!("Telegram Bot 已启动");
+    info!(
+        api_url = ?state.config.telegram_api_url,
+        timeout_secs = state.config.telegram_request_timeout_secs,
+        "Telegram Bot 已启动"
+    );
     if let Some(webhook_url) = &state.config.webhook_url {
         use teloxide::update_listeners::webhooks;
         let host: std::net::IpAddr = state.config.webhook_host.parse()?;

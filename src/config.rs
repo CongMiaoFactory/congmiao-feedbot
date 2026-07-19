@@ -28,6 +28,7 @@ impl MediaSpoilerMode {
 pub struct Config {
     pub telegram_token: String,
     pub telegram_api_url: Option<String>,
+    pub telegram_request_timeout_secs: u64,
     pub database_url: String,
     pub redis_url: Option<String>,
     pub fxtwitter_api_base: String,
@@ -65,6 +66,7 @@ impl Config {
         Ok(Self {
             telegram_token,
             telegram_api_url: value("TELEGRAM_API_URL"),
+            telegram_request_timeout_secs: parse("TELEGRAM_REQUEST_TIMEOUT_SECS", 600),
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://data/feedbot.db?mode=rwc".to_string()),
             redis_url: value("REDIS_URL"),

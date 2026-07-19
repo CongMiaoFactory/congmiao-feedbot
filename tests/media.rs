@@ -15,6 +15,7 @@ fn config(temp_dir: PathBuf) -> Config {
     Config {
         telegram_token: "test".into(),
         telegram_api_url: None,
+        telegram_request_timeout_secs: 600,
         database_url: "sqlite::memory:".into(),
         redis_url: None,
         fxtwitter_api_base: String::new(),
