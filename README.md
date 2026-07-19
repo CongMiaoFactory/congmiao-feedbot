@@ -29,6 +29,14 @@
 
 Docker 镜像发布到 `ghcr.io/congmiaofactory/congmiao-feedbot`，不需要在服务器上编译 Rust。
 
+如果 GHCR Package 保持为 Private，先使用具有 `read:packages` 权限的 GitHub PAT 登录；Package 设为 Public 后可跳过此步：
+
+```bash
+export GHCR_USER=你的GitHub用户名
+export GHCR_TOKEN=你的GitHub_PAT
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+```
+
 ```bash
 git clone https://github.com/CongMiaoFactory/congmiao-feedbot.git
 cd congmiao-feedbot
@@ -92,6 +100,13 @@ set -a
 source .env
 set +a
 ./congmiao-feedbot
+```
+
+如果 GitHub 仓库是 Private，上述两条 `curl` 命令需增加仓库读取令牌：
+
+```bash
+curl -fL -H "Authorization: Bearer ${GITHUB_TOKEN}" -O "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
+curl -fL -H "Authorization: Bearer ${GITHUB_TOKEN}" -O "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 ```
 
 非 Docker 方式需要自行启动网易云 sidecar，并保持：
