@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use congmiao_feedbot::{
     Author, Config, ContentKind, MediaItem, MediaKind, ParsedContent, Platform,
-    media::MediaProcessor,
+    media::{MediaProcessor, telegram_photo_dimensions_valid},
 };
 use reqwest::Client;
 use tokio::process::Command;
@@ -31,6 +31,7 @@ fn config(temp_dir: PathBuf) -> Config {
         bilibili_live_api_base: String::new(),
         bilibili_www_base: String::new(),
         ffmpeg_path: "ffmpeg".into(),
+        ffprobe_path: "ffprobe".into(),
         yt_dlp_path: "yt-dlp".into(),
         temp_dir,
         upload_workers: 1,
@@ -44,6 +45,85 @@ fn config(temp_dir: PathBuf) -> Config {
         admin_user_id: None,
         media_spoiler_mode: congmiao_feedbot::MediaSpoilerMode::Auto,
     }
+}
+
+#[test]
+fn validates_telegram_photo_dimensions() {
+    assert!(telegram_photo_dimensions_valid(5000, 5000));
+    assert!(telegram_photo_dimensions_valid(100, 2000));
+    assert!(!telegram_photo_dimensions_valid(100, 2001));
+    assert!(!telegram_photo_dimensions_valid(5001, 5000));
+    assert!(!telegram_photo_dimensions_valid(0, 100));
+}
+
+#[tokio::test]
+async fn oversized_photo_dimensions_force_document_mode() {
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let photo = fixture.path().join("tall.jpg");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=100x2102",
+            "-frames:v",
+            "1",
+        ])
+        .arg(&photo)
+        .output()
+        .await
+        .unwrap();
+    assert!(generated.status.success());
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tall.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(tokio::fs::read(&photo).await.unwrap()),
+        )
+        .mount(&server)
+        .await;
+    let item = MediaItem {
+        kind: MediaKind::Photo,
+        source_url: format!("{}/tall.jpg", server.uri()),
+        thumbnail_url: None,
+        filename: "tall.jpg".into(),
+        mime_type: Some("image/jpeg".into()),
+        duration_secs: None,
+        width: None,
+        height: None,
+        size: None,
+        headers: Default::default(),
+        cache_key: "test:tall-photo".into(),
+        requires_download: true,
+        secondary_url: None,
+    };
+    let content = ParsedContent {
+        platform: Platform::X,
+        kind: ContentKind::Post,
+        id: "tall".into(),
+        canonical_url: "https://example.com/tall".into(),
+        author: Author::default(),
+        title: String::new(),
+        text: String::new(),
+        sensitive: false,
+        stats: Default::default(),
+        media: vec![item.clone()],
+        collection_items: vec![],
+    };
+    let output_dir = tempfile::tempdir().unwrap();
+    let processor = MediaProcessor::new(Client::new(), &config(output_dir.path().into()));
+    let prepared = processor.prepare(&content, &item, 720).await.unwrap();
+    assert!(prepared.force_document);
+    processor.cleanup(prepared).await;
 }
 
 #[tokio::test]
@@ -68,7 +148,7 @@ async fn downloads_and_merges_dash_tracks_with_ffmpeg() {
             "color=c=blue:s=320x240:d=0.2",
             "-an",
             "-c:v",
-            "libx264",
+            "mpeg4",
         ])
         .arg(&video)
         .output()
@@ -137,6 +217,27 @@ async fn downloads_and_merges_dash_tracks_with_ffmpeg() {
     let processor = MediaProcessor::new(Client::new(), &config(output_dir.path().into()));
     let prepared = processor.prepare(&content, &item, 720).await.unwrap();
     assert!(tokio::fs::metadata(&prepared.path).await.unwrap().len() > 0);
+    assert_eq!(prepared.item.width, Some(320));
+    assert_eq!(prepared.item.height, Some(240));
+    assert_eq!(prepared.item.duration_secs, Some(1));
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(&prepared.path)
+        .output()
+        .await
+        .unwrap();
+    let probe = String::from_utf8_lossy(&probe.stdout);
+    assert!(probe.contains("codec_name=h264"));
+    assert!(probe.contains("pix_fmt=yuv420p"));
     processor.cleanup(prepared).await;
 }
 

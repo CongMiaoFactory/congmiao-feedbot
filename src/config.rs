@@ -44,6 +44,7 @@ pub struct Config {
     pub bilibili_live_api_base: String,
     pub bilibili_www_base: String,
     pub ffmpeg_path: String,
+    pub ffprobe_path: String,
     pub yt_dlp_path: String,
     pub temp_dir: PathBuf,
     pub upload_workers: usize,
@@ -91,6 +92,7 @@ impl Config {
             bilibili_www_base: env::var("BILIBILI_WWW_BASE")
                 .unwrap_or_else(|_| "https://www.bilibili.com".into()),
             ffmpeg_path: env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string()),
+            ffprobe_path: env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string()),
             yt_dlp_path: env::var("YT_DLP_PATH").unwrap_or_else(|_| "yt-dlp".to_string()),
             temp_dir: PathBuf::from(env::var("TEMP_DIR").unwrap_or_else(|_| "tmp".to_string())),
             upload_workers: parse("UPLOAD_WORKERS", 4),

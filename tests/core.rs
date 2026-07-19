@@ -35,6 +35,7 @@ fn config() -> Config {
         bilibili_live_api_base: "https://api.live.bilibili.com".into(),
         bilibili_www_base: "https://www.bilibili.com".into(),
         ffmpeg_path: "ffmpeg".into(),
+        ffprobe_path: "ffprobe".into(),
         yt_dlp_path: "missing-yt-dlp".into(),
         temp_dir: PathBuf::from("tmp"),
         upload_workers: 1,

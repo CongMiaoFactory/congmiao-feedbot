@@ -1,12 +1,16 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use reqwest::Client;
+use serde::Deserialize;
 use tokio::{fs::File, io::AsyncWriteExt, process::Command, sync::Semaphore};
 
 use crate::{
@@ -14,16 +18,55 @@ use crate::{
     model::{MediaItem, MediaKind, ParsedContent},
 };
 
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug)]
 pub struct PreparedMedia {
     pub item: MediaItem,
     pub path: PathBuf,
+    pub force_document: bool,
+}
+
+#[derive(Debug, Default)]
+struct VideoMetadata {
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_secs: Option<u64>,
+    format_name: String,
+    video_codec: String,
+    pixel_format: String,
+    audio_codec: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeOutput {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    #[serde(default)]
+    format: ProbeFormat,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeStream {
+    codec_type: Option<String>,
+    codec_name: Option<String>,
+    pix_fmt: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    duration: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProbeFormat {
+    format_name: Option<String>,
+    duration: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct MediaProcessor {
     client: Client,
     ffmpeg: String,
+    ffprobe: String,
     yt_dlp: String,
     youtube_cookies: Option<PathBuf>,
     temp_dir: PathBuf,
@@ -36,6 +79,7 @@ impl MediaProcessor {
         Self {
             client,
             ffmpeg: config.ffmpeg_path.clone(),
+            ffprobe: config.ffprobe_path.clone(),
             yt_dlp: config.yt_dlp_path.clone(),
             youtube_cookies: config.youtube_cookies_file.clone(),
             temp_dir: config.temp_dir.clone(),
@@ -54,7 +98,7 @@ impl MediaProcessor {
     pub async fn prepare_thumbnail(&self, url: &str, cache_key: &str) -> Result<PathBuf> {
         let _permit = self.semaphore.acquire().await?;
         tokio::fs::create_dir_all(&self.temp_dir).await?;
-        let safe = cache_key.replace([':', '/', '\\'], "-");
+        let safe = unique_temp_key(cache_key);
         let source = self.temp_dir.join(format!("{safe}-cover.part"));
         let output = self.temp_dir.join(format!("{safe}-cover.jpg"));
         self.download(url, &source, &Default::default()).await?;
@@ -99,7 +143,7 @@ impl MediaProcessor {
     ) -> Result<PreparedMedia> {
         let _permit = self.semaphore.acquire().await?;
         tokio::fs::create_dir_all(&self.temp_dir).await?;
-        let safe = item.cache_key.replace([':', '/', '\\'], "-");
+        let safe = unique_temp_key(&item.cache_key);
         let output = self
             .temp_dir
             .join(format!("{safe}-{}", sanitize(&item.filename)));
@@ -136,15 +180,38 @@ impl MediaProcessor {
                 tokio::fs::rename(&primary, &output).await?;
             }
         }
-        let item_limit = if item.kind == MediaKind::Photo && self.max_size < 2_000_000_000 {
-            10 * 1024 * 1024
+        let mut prepared_item = item.clone();
+        let mut video_metadata = if item.kind == MediaKind::Video {
+            let mut metadata = self.probe_video(&output).await?;
+            if !video_is_telegram_compatible(&metadata) {
+                self.normalize_video(&output).await?;
+                metadata = self.probe_video(&output).await?;
+            }
+            Some(metadata)
         } else {
-            self.max_size
+            None
         };
+        let force_document = if item.kind == MediaKind::Photo {
+            let path = output.clone();
+            tokio::task::spawn_blocking(move || photo_exceeds_telegram_dimensions(&path))
+                .await?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let item_limit =
+            if item.kind == MediaKind::Photo && !force_document && self.max_size < 2_000_000_000 {
+                10 * 1024 * 1024
+            } else {
+                self.max_size
+            };
         if tokio::fs::metadata(&output).await?.len() > item_limit
             && matches!(item.kind, MediaKind::Video | MediaKind::Animation)
         {
             self.compress_video(&output).await?;
+            if item.kind == MediaKind::Video {
+                video_metadata = Some(self.probe_video(&output).await?);
+            }
         }
         if tokio::fs::metadata(&output).await?.len() > item_limit && item.kind == MediaKind::Photo {
             self.compress_image(&output).await?;
@@ -154,9 +221,15 @@ impl MediaProcessor {
             let _ = tokio::fs::remove_file(&output).await;
             bail!("媒体文件 {} MB 超过 Telegram 限制", size / 1024 / 1024);
         }
+        if let Some(metadata) = video_metadata {
+            prepared_item.width = metadata.width.or(prepared_item.width);
+            prepared_item.height = metadata.height.or(prepared_item.height);
+            prepared_item.duration_secs = metadata.duration_secs.or(prepared_item.duration_secs);
+        }
         Ok(PreparedMedia {
-            item: item.clone(),
+            item: prepared_item,
             path: output,
+            force_document,
         })
     }
 
@@ -185,6 +258,97 @@ impl MediaProcessor {
         file.flush().await?;
         Ok(())
     }
+    async fn probe_video(&self, path: &Path) -> Result<VideoMetadata> {
+        let output = Command::new(&self.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=format_name,duration:stream=codec_type,codec_name,pix_fmt,width,height,duration",
+                "-of",
+                "json",
+            ])
+            .arg(path)
+            .output()
+            .await
+            .context("无法启动 ffprobe")?;
+        if !output.status.success() {
+            bail!(
+                "ffprobe 媒体探测失败: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let probe: ProbeOutput = serde_json::from_slice(&output.stdout)?;
+        let video = probe
+            .streams
+            .iter()
+            .find(|stream| stream.codec_type.as_deref() == Some("video"))
+            .ok_or_else(|| anyhow!("媒体文件缺少视频流"))?;
+        let audio_codec = probe
+            .streams
+            .iter()
+            .find(|stream| stream.codec_type.as_deref() == Some("audio"))
+            .and_then(|stream| stream.codec_name.clone());
+        let duration_secs = video
+            .duration
+            .as_deref()
+            .and_then(parse_duration)
+            .or_else(|| probe.format.duration.as_deref().and_then(parse_duration));
+        Ok(VideoMetadata {
+            width: video.width,
+            height: video.height,
+            duration_secs,
+            format_name: probe.format.format_name.unwrap_or_default(),
+            video_codec: video.codec_name.clone().unwrap_or_default(),
+            pixel_format: video.pix_fmt.clone().unwrap_or_default(),
+            audio_codec,
+        })
+    }
+
+    async fn normalize_video(&self, path: &Path) -> Result<()> {
+        let normalized = path.with_extension("normalized.mp4");
+        let output = Command::new(&self.ffmpeg)
+            .args(["-y", "-fflags", "+genpts", "-i"])
+            .arg(path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
+            ])
+            .arg(&normalized)
+            .output()
+            .await
+            .context("无法启动 FFmpeg")?;
+        if !output.status.success() {
+            bail!(
+                "FFmpeg 视频兼容性转换失败: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        tokio::fs::remove_file(path).await?;
+        tokio::fs::rename(normalized, path).await?;
+        Ok(())
+    }
+
     async fn download_youtube(&self, url: &str, target: &Path, quality: u32) -> Result<()> {
         let format = format!(
             "bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<={quality}][ext=mp4]/best[height<={quality}]"
@@ -217,12 +381,22 @@ impl MediaProcessor {
     }
     async fn merge(&self, video: &Path, audio: &Path, output: &Path) -> Result<()> {
         let out = Command::new(&self.ffmpeg)
-            .arg("-y")
-            .arg("-i")
+            .args(["-y", "-fflags", "+genpts", "-i"])
             .arg(video)
             .arg("-i")
             .arg(audio)
-            .args(["-c", "copy", "-movflags", "+faststart"])
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
+            ])
             .arg(output)
             .output()
             .await
@@ -235,10 +409,13 @@ impl MediaProcessor {
     async fn compress_video(&self, path: &Path) -> Result<()> {
         let compressed = path.with_extension("compressed.mp4");
         let out = Command::new(&self.ffmpeg)
-            .arg("-y")
-            .arg("-i")
+            .args(["-y", "-fflags", "+genpts", "-i"])
             .arg(path)
             .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
                 "-vf",
                 "scale='min(1280,iw)':-2",
                 "-c:v",
@@ -247,12 +424,16 @@ impl MediaProcessor {
                 "veryfast",
                 "-crf",
                 "28",
+                "-pix_fmt",
+                "yuv420p",
                 "-c:a",
                 "aac",
                 "-b:a",
                 "96k",
                 "-movflags",
                 "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
             ])
             .arg(&compressed)
             .output()
@@ -352,6 +533,44 @@ impl MediaProcessor {
     pub async fn cleanup(&self, prepared: PreparedMedia) {
         let _ = tokio::fs::remove_file(prepared.path).await;
     }
+}
+
+fn parse_duration(value: &str) -> Option<u64> {
+    let seconds = value.parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds > 0.0).then(|| seconds.ceil() as u64)
+}
+
+fn video_is_telegram_compatible(metadata: &VideoMetadata) -> bool {
+    metadata.format_name.split(',').any(|name| name == "mp4")
+        && metadata.video_codec == "h264"
+        && matches!(metadata.pixel_format.as_str(), "yuv420p" | "yuvj420p")
+        && metadata
+            .audio_codec
+            .as_deref()
+            .is_none_or(|codec| codec == "aac")
+        && metadata.width.is_some_and(|width| width > 0)
+        && metadata.height.is_some_and(|height| height > 0)
+        && metadata.duration_secs.is_some_and(|duration| duration > 0)
+}
+
+pub fn telegram_photo_dimensions_valid(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && u64::from(width) + u64::from(height) <= 10_000
+        && u64::from(width.max(height)) <= u64::from(width.min(height)) * 20
+}
+
+fn photo_exceeds_telegram_dimensions(path: &Path) -> Result<bool> {
+    let (width, height) = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_dimensions()?;
+    Ok(!telegram_photo_dimensions_valid(width, height))
+}
+
+fn unique_temp_key(cache_key: &str) -> String {
+    let safe = cache_key.replace([':', '/', '\\'], "-");
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{safe}-{sequence}")
 }
 
 fn sanitize(name: &str) -> String {

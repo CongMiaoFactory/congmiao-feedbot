@@ -23,7 +23,7 @@ use crate::{
     Config, MediaSpoilerMode, ProviderRegistry, RuntimeCredentials,
     cache::AppCache,
     login::{LoginPoll, LoginService},
-    media::MediaProcessor,
+    media::{MediaProcessor, telegram_photo_dimensions_valid},
     model::*,
     storage::Storage,
 };
@@ -367,9 +367,14 @@ async fn send_content(
     }
     if !options.file_mode
         && selected.len() > 1
-        && selected
-            .iter()
-            .all(|m| matches!(m.kind, MediaKind::Photo | MediaKind::Video))
+        && selected.iter().all(|item| match item.kind {
+            MediaKind::Video => true,
+            MediaKind::Photo => item
+                .width
+                .zip(item.height)
+                .is_some_and(|(width, height)| telegram_photo_dimensions_valid(width, height)),
+            _ => false,
+        })
     {
         for chunk in selected.chunks(10) {
             let mut group = Vec::new();
@@ -392,7 +397,18 @@ async fn send_content(
                     MediaKind::Video => {
                         let mut media = InputMediaVideo::new(input)
                             .caption(c.unwrap_or_default())
-                            .parse_mode(ParseMode::Html);
+                            .parse_mode(ParseMode::Html)
+                            .supports_streaming(true);
+                        media.width = item.width.and_then(|value| u16::try_from(value).ok());
+                        media.height = item.height.and_then(|value| u16::try_from(value).ok());
+                        media.duration = item
+                            .duration_secs
+                            .and_then(|value| u16::try_from(value).ok());
+                        media.cover = item
+                            .thumbnail_url
+                            .as_ref()
+                            .and_then(|url| url.parse().ok())
+                            .map(InputFile::url);
                         media.has_spoiler = spoiler;
                         InputMedia::Video(media)
                     }
@@ -427,7 +443,7 @@ async fn send_content(
         let cached_kind = kind_name(item.kind);
         if let Some(file_id) = state
             .storage
-            .get_file_id(&item.cache_key, cached_kind)
+            .get_file_id(&telegram_cache_key(item), cached_kind)
             .await?
         {
             send_cached(
@@ -451,12 +467,12 @@ async fn send_content(
             .media
             .prepare(&content, item, options.quality.unwrap_or(720))
             .await;
-        let prepared_thumbnail = if item.kind == MediaKind::Audio {
+        let prepared_thumbnail = if matches!(item.kind, MediaKind::Audio | MediaKind::Video) {
             if let Some(url) = &item.thumbnail_url {
                 match state.media.prepare_thumbnail(url, &item.cache_key).await {
                     Ok(path) => Some(path),
                     Err(err) => {
-                        warn!(?err, "音频封面准备失败，继续发送无封面音频");
+                        warn!(?err, "媒体封面准备失败，继续发送无封面媒体");
                         None
                     }
                 }
@@ -470,9 +486,10 @@ async fn send_content(
             Ok(p) => {
                 send_local(
                     bot,
-                    item,
+                    &p.item,
                     &p.path,
                     options.file_mode,
+                    p.force_document,
                     SendOptions {
                         chat: msg.chat.id,
                         caption: if index == 0 { &caption_text } else { "" },
@@ -526,7 +543,7 @@ async fn input_for_item(
 ) -> Result<InputFile> {
     if let Some(id) = state
         .storage
-        .get_file_id(&item.cache_key, kind_name(item.kind))
+        .get_file_id(&telegram_cache_key(item), kind_name(item.kind))
         .await?
     {
         return Ok(InputFile::file_id(teloxide::types::FileId(id)));
@@ -556,6 +573,7 @@ async fn send_local(
     item: &MediaItem,
     path: &std::path::Path,
     document: bool,
+    force_document: bool,
     options: SendOptions<'_>,
 ) -> Result<Message> {
     let SendOptions {
@@ -570,7 +588,7 @@ async fn send_local(
     let input = InputFile::file(path.to_path_buf()).file_name(item.filename.clone());
     // Telegram documents cannot carry a spoiler. Sensitive visual media stays
     // photo/video/animation even when /file was requested.
-    let req = if (document && !spoiler) || item.kind == MediaKind::Document {
+    let req = if force_document || (document && !spoiler) || item.kind == MediaKind::Document {
         bot.send_document(chat, input)
             .reply_parameters(ReplyParameters::new(reply_to))
             .caption(caption)
@@ -587,13 +605,34 @@ async fn send_local(
                     .await?
             }
             MediaKind::Video => {
-                bot.send_video(chat, input)
+                let request = bot
+                    .send_video(chat, input)
                     .reply_parameters(ReplyParameters::new(reply_to))
                     .has_spoiler(spoiler)
                     .caption(caption)
                     .parse_mode(ParseMode::Html)
-                    .supports_streaming(true)
-                    .await?
+                    .supports_streaming(true);
+                let request = if let Some(duration) = item.duration_secs {
+                    request.duration(duration.min(u64::from(u32::MAX)) as u32)
+                } else {
+                    request
+                };
+                let request = if let Some(width) = item.width {
+                    request.width(width)
+                } else {
+                    request
+                };
+                let request = if let Some(height) = item.height {
+                    request.height(height)
+                } else {
+                    request
+                };
+                let request = if let Some(path) = thumbnail {
+                    request.thumbnail(InputFile::file(path.to_path_buf()).file_name("cover.jpg"))
+                } else {
+                    request
+                };
+                request.await?
             }
             MediaKind::Audio => {
                 let request = bot
@@ -699,7 +738,7 @@ async fn cache_message(state: &BotState, item: &MediaItem, msg: &Message) {
         let _ = state
             .storage
             .put_file_id(
-                &item.cache_key,
+                &telegram_cache_key(item),
                 kind_name(item.kind),
                 id.0.as_str(),
                 Some(unique.0.as_str()),
@@ -753,7 +792,7 @@ async fn inline_result(state: &BotState, content: &ParsedContent) -> InlineQuery
     if let Some(item) = content.media.first() {
         if let Ok(Some(file_id)) = state
             .storage
-            .get_file_id(&item.cache_key, kind_name(item.kind))
+            .get_file_id(&telegram_cache_key(item), kind_name(item.kind))
             .await
         {
             let id = FileId(file_id);
@@ -1033,6 +1072,14 @@ fn truncate_html(text: &str, max: usize) -> String {
     escaped.push('…');
     escaped
 }
+fn telegram_cache_key(item: &MediaItem) -> String {
+    if item.kind == MediaKind::Video {
+        format!("{}:telegram-video-v2", item.cache_key)
+    } else {
+        item.cache_key.clone()
+    }
+}
+
 fn kind_name(kind: MediaKind) -> &'static str {
     match kind {
         MediaKind::Photo => "photo",
