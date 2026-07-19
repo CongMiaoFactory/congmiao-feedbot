@@ -51,6 +51,46 @@ impl MediaProcessor {
         self.max_size
     }
 
+    pub async fn prepare_thumbnail(&self, url: &str, cache_key: &str) -> Result<PathBuf> {
+        let _permit = self.semaphore.acquire().await?;
+        tokio::fs::create_dir_all(&self.temp_dir).await?;
+        let safe = cache_key.replace([':', '/', '\\'], "-");
+        let source = self.temp_dir.join(format!("{safe}-cover.part"));
+        let output = self.temp_dir.join(format!("{safe}-cover.jpg"));
+        self.download(url, &source, &Default::default()).await?;
+        let result = Command::new(&self.ffmpeg)
+            .arg("-y")
+            .arg("-i")
+            .arg(&source)
+            .args([
+                "-vf",
+                "scale=320:320:force_original_aspect_ratio=decrease",
+                "-frames:v",
+                "1",
+                "-q:v",
+                "5",
+            ])
+            .arg(&output)
+            .output()
+            .await?;
+        let _ = tokio::fs::remove_file(source).await;
+        if !result.status.success() {
+            bail!(
+                "FFmpeg 封面处理失败: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        if tokio::fs::metadata(&output).await?.len() > 200 * 1024 {
+            let _ = tokio::fs::remove_file(&output).await;
+            bail!("音频封面超过 Telegram 200KB 限制");
+        }
+        Ok(output)
+    }
+
+    pub async fn cleanup_path(&self, path: impl AsRef<Path>) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
     pub async fn prepare(
         &self,
         content: &ParsedContent,

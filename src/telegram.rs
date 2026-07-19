@@ -427,6 +427,7 @@ async fn send_content(
                     reply_to: msg.id,
                     title: &content.title,
                     performer: &content.author.name,
+                    thumbnail: None,
                 },
             )
             .await?;
@@ -436,6 +437,21 @@ async fn send_content(
             .media
             .prepare(&content, item, options.quality.unwrap_or(720))
             .await;
+        let prepared_thumbnail = if item.kind == MediaKind::Audio {
+            if let Some(url) = &item.thumbnail_url {
+                match state.media.prepare_thumbnail(url, &item.cache_key).await {
+                    Ok(path) => Some(path),
+                    Err(err) => {
+                        warn!(?err, "音频封面准备失败，继续发送无封面音频");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let sent = match prepared.as_ref() {
             Ok(p) => {
                 send_local(
@@ -450,6 +466,7 @@ async fn send_content(
                         reply_to: msg.id,
                         title: &content.title,
                         performer: &content.author.name,
+                        thumbnail: prepared_thumbnail.as_deref(),
                     },
                 )
                 .await?
@@ -478,6 +495,9 @@ async fn send_content(
         cache_message(state, item, &sent).await;
         if let Ok(p) = prepared {
             state.media.cleanup(p).await;
+        }
+        if let Some(path) = prepared_thumbnail {
+            state.media.cleanup_path(path).await;
         }
     }
     Ok(())
@@ -514,6 +534,7 @@ struct SendOptions<'a> {
     reply_to: MessageId,
     title: &'a str,
     performer: &'a str,
+    thumbnail: Option<&'a std::path::Path>,
 }
 
 async fn send_local(
@@ -530,6 +551,7 @@ async fn send_local(
         reply_to,
         title,
         performer,
+        thumbnail,
     } = options;
     let input = InputFile::file(path.to_path_buf()).file_name(item.filename.clone());
     // Telegram documents cannot carry a spoiler. Sensitive visual media stays
@@ -560,13 +582,19 @@ async fn send_local(
                     .await?
             }
             MediaKind::Audio => {
-                bot.send_audio(chat, input)
+                let request = bot
+                    .send_audio(chat, input)
                     .reply_parameters(ReplyParameters::new(reply_to))
                     .title(title)
                     .performer(performer)
                     .caption(caption)
-                    .parse_mode(ParseMode::Html)
-                    .await?
+                    .parse_mode(ParseMode::Html);
+                let request = if let Some(path) = thumbnail {
+                    request.thumbnail(InputFile::file(path.to_path_buf()).file_name("cover.jpg"))
+                } else {
+                    request
+                };
+                request.await?
             }
             MediaKind::Animation => {
                 bot.send_animation(chat, input)
@@ -595,6 +623,7 @@ async fn send_cached(
         reply_to,
         title,
         performer,
+        thumbnail: _,
     } = options;
     let input = InputFile::file_id(teloxide::types::FileId(id));
     Ok(match item.kind {

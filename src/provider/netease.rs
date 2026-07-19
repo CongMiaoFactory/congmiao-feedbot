@@ -172,7 +172,9 @@ impl Provider for NeteaseProvider {
                         height: None,
                         size: get_u64(&audio, "/data/0/size"),
                         headers: Default::default(),
-                        cache_key: format!("netease:song:{id}:standard"),
+                        // v2 invalidates old Telegram file_ids that were uploaded
+                        // before audio title/performer/cover metadata was attached.
+                        cache_key: format!("netease:song:{id}:standard:v2"),
                         requires_download: true,
                         secondary_url: None,
                     }],
