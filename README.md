@@ -21,6 +21,8 @@
 - `/video [360p|480p|720p|1080p] <url>`：指定视频上限，默认 720p。
 - `/file <url>`：以文件形式发送媒体。
 - `/cover <url>`：只发送封面（来源提供封面时）。
+- `/login bili`：管理员私聊扫码登录 Bilibili，并立即更新持久化 Cookie。
+- `/login netease`：管理员私聊扫码登录网易云音乐，并立即更新持久化 Cookie。
 - 启用 BotFather Inline Mode 后，可通过 `@botname <url>` 生成解析预览。
 
 默认视频选择 H.264/AAC 且不高于 720p。超过 Telegram 大小限制时会用 FFmpeg 压缩；仍超限则退回文本和原链接。成功上传的 `file_id` 存入 SQLite，重复发送不再下载。
@@ -85,7 +87,7 @@ sudo apt-get update
 sudo apt-get install -y ffmpeg python3 python3-pip curl
 sudo pip3 install --break-system-packages -U yt-dlp
 
-VERSION=v0.1.0
+VERSION=v0.2.0
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
@@ -162,12 +164,25 @@ cargo run --release
 
 ## 凭证
 
-- `BILIBILI_COOKIE`：提高 B站清晰度并解析需要登录的内容。
+- `ADMIN_USER_ID`：唯一允许执行 `/login` 的 Telegram 数字用户 ID。未配置时私聊发送 `/login`，Bot 会回复当前用户 ID。
+- Bilibili：推荐私聊发送 `/login bili`，使用客户端扫码确认。无需手动填写 Cookie。
+- 网易云音乐：推荐私聊发送 `/login netease`，使用客户端扫码确认。无需手动填写 Cookie。
+- 扫码取得的 Cookie 存入 SQLite `provider_credentials`，重启后仍然有效；Provider 会立即读取新凭证，无需重启 Bot。
+- `BILIBILI_COOKIE`、`NETEASE_COOKIE`：仅作为首次启动或扫码不可用时的可选回退值。
 - `YOUTUBE_COOKIES_FILE`：yt-dlp Netscape cookie 文件路径。
 - `YOUTUBE_API_KEY`：使用官方 Data API 获取统计信息；未设置时走免费回退。
 - `PIXIV_REFRESH_TOKEN`：配置后优先使用认证 App API；未配置时使用免费 Pixiv Web API。两种路径都可将 ugoira 帧包转换为 MP4。
 
 不要提交 `.env`、cookies 或 token。所有环境变量参见 `.env.example`。
+
+### 扫码登录流程
+
+1. 私聊 Bot 发送 `/login`。若尚未设置管理员，复制 Bot 回复的数字用户 ID。
+2. 在 `.env` 填写 `ADMIN_USER_ID=<数字ID>`，只需配置一次并重启 Bot。
+3. 私聊发送 `/login bili` 或 `/login netease`。
+4. 使用对应手机客户端扫描二维码并确认；Bot 会回复“Cookie 已持久化并立即生效”。
+
+群聊中的 `/login` 不会展示二维码，非管理员也不能更新公共 Bot 的平台凭证。Cookie 失效后重新扫码即可覆盖旧值。
 
 ## 开发与验收
 

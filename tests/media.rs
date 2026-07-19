@@ -20,10 +20,12 @@ fn config(temp_dir: PathBuf) -> Config {
         fxtwitter_api_base: String::new(),
         pixiv_web_api_base: String::new(),
         netease_api_base: String::new(),
+        netease_cookie: None,
         youtube_api_key: None,
         youtube_cookies_file: None,
         pixiv_refresh_token: None,
         bilibili_cookie: None,
+        bilibili_passport_base: String::new(),
         bilibili_api_base: String::new(),
         bilibili_live_api_base: String::new(),
         bilibili_www_base: String::new(),
@@ -38,6 +40,7 @@ fn config(temp_dir: PathBuf) -> Config {
         webhook_url: None,
         webhook_host: "127.0.0.1".into(),
         webhook_port: 8080,
+        admin_user_id: None,
     }
 }
 

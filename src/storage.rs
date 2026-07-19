@@ -45,4 +45,21 @@ impl Storage {
             .bind(cache_key).bind(media_kind).bind(file_id).bind(unique_id).execute(&self.pool).await?;
         Ok(())
     }
+
+    pub async fn get_credential(&self, provider: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM provider_credentials WHERE provider=?")
+            .bind(provider)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("value")))
+    }
+
+    pub async fn put_credential(&self, provider: &str, value: &str) -> Result<()> {
+        sqlx::query("INSERT INTO provider_credentials(provider,value) VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET value=excluded.value,updated_at=unixepoch()")
+            .bind(provider)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }

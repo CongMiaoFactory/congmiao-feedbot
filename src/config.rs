@@ -11,10 +11,12 @@ pub struct Config {
     pub fxtwitter_api_base: String,
     pub pixiv_web_api_base: String,
     pub netease_api_base: String,
+    pub netease_cookie: Option<String>,
     pub youtube_api_key: Option<String>,
     pub youtube_cookies_file: Option<PathBuf>,
     pub pixiv_refresh_token: Option<String>,
     pub bilibili_cookie: Option<String>,
+    pub bilibili_passport_base: String,
     pub bilibili_api_base: String,
     pub bilibili_live_api_base: String,
     pub bilibili_www_base: String,
@@ -29,6 +31,7 @@ pub struct Config {
     pub webhook_url: Option<String>,
     pub webhook_host: String,
     pub webhook_port: u16,
+    pub admin_user_id: Option<u64>,
 }
 
 impl Config {
@@ -49,10 +52,13 @@ impl Config {
                 .unwrap_or_else(|_| "https://www.pixiv.net".to_string()),
             netease_api_base: env::var("NETEASE_API_BASE")
                 .unwrap_or_else(|_| "http://netease-api:3000".to_string()),
+            netease_cookie: value("NETEASE_COOKIE"),
             youtube_api_key: value("YOUTUBE_API_KEY"),
             youtube_cookies_file: value("YOUTUBE_COOKIES_FILE").map(PathBuf::from),
             pixiv_refresh_token: value("PIXIV_REFRESH_TOKEN"),
             bilibili_cookie: value("BILIBILI_COOKIE"),
+            bilibili_passport_base: env::var("BILIBILI_PASSPORT_BASE")
+                .unwrap_or_else(|_| "https://passport.bilibili.com".into()),
             bilibili_api_base: env::var("BILIBILI_API_BASE")
                 .unwrap_or_else(|_| "https://api.bilibili.com".into()),
             bilibili_live_api_base: env::var("BILIBILI_LIVE_API_BASE")
@@ -70,6 +76,7 @@ impl Config {
             webhook_url: value("WEBHOOK_URL"),
             webhook_host: env::var("WEBHOOK_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             webhook_port: parse("WEBHOOK_PORT", 8080),
+            admin_user_id: value("ADMIN_USER_ID").and_then(|v| v.parse().ok()),
         })
     }
 }

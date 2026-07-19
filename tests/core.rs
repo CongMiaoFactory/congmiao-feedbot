@@ -2,7 +2,9 @@ use std::{path::PathBuf, time::Duration};
 
 use congmiao_feedbot::{
     Config, ContentKind, ParseOptions, ParseRequest, Platform, Provider, ProviderRegistry,
+    RuntimeCredentials,
     cache::AppCache,
+    login::{LoginPoll, LoginService},
     provider::{BilibiliProvider, NeteaseProvider, PixivProvider, XProvider},
     storage::Storage,
     telegram::{caption, extract_urls},
@@ -22,10 +24,12 @@ fn config() -> Config {
         fxtwitter_api_base: "https://api.fxtwitter.com".into(),
         pixiv_web_api_base: "https://www.pixiv.net".into(),
         netease_api_base: "http://127.0.0.1:3000".into(),
+        netease_cookie: None,
         youtube_api_key: None,
         youtube_cookies_file: None,
         pixiv_refresh_token: None,
         bilibili_cookie: None,
+        bilibili_passport_base: "https://passport.bilibili.com".into(),
         bilibili_api_base: "https://api.bilibili.com".into(),
         bilibili_live_api_base: "https://api.live.bilibili.com".into(),
         bilibili_www_base: "https://www.bilibili.com".into(),
@@ -40,6 +44,7 @@ fn config() -> Config {
         webhook_url: None,
         webhook_host: "127.0.0.1".into(),
         webhook_port: 8080,
+        admin_user_id: None,
     }
 }
 
@@ -187,9 +192,11 @@ async fn pixiv_provider_supports_anonymous_ugoira_metadata() {
 #[tokio::test]
 async fn netease_provider_parses_song_through_sidecar() {
     let server = MockServer::start().await;
-    Mock::given(method("GET")).and(path("/song/detail")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"songs":[{"name":"Song","dt":1000,"ar":[{"name":"Singer"}],"al":{"name":"Album","picUrl":"https://img/cover.jpg"}}]}))).mount(&server).await;
+    Mock::given(method("GET")).and(path("/song/detail")).and(query_param("cookie", "MUSIC_U=test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"songs":[{"name":"Song","dt":1000,"ar":[{"name":"Singer"}],"al":{"name":"Album","picUrl":"https://img/cover.jpg"}}]}))).mount(&server).await;
     Mock::given(method("GET"))
         .and(path("/song/url/v1"))
+        .and(query_param("cookie", "MUSIC_U=test"))
         .respond_with(ResponseTemplate::new(200).set_body_json(
             serde_json::json!({"data":[{"url":"https://audio/song.mp3","size":100}]}),
         ))
@@ -197,7 +204,12 @@ async fn netease_provider_parses_song_through_sidecar() {
         .await;
     let mut c = config();
     c.netease_api_base = server.uri();
-    let parsed = NeteaseProvider::new(Client::new(), &c)
+    let credentials = RuntimeCredentials::memory(&c);
+    credentials
+        .set_netease("MUSIC_U=test".into())
+        .await
+        .unwrap();
+    let parsed = NeteaseProvider::new_with_credentials(Client::new(), &c, credentials)
         .parse(&ParseRequest {
             url: "https://music.163.com/#/song?id=123".into(),
             options: Default::default(),
@@ -263,4 +275,88 @@ async fn sqlite_cache_and_local_rate_limit_work() {
     assert!(cache.allow("u", 2, Duration::from_secs(60)).await);
     assert!(cache.allow("u", 2, Duration::from_secs(60)).await);
     assert!(!cache.allow("u", 2, Duration::from_secs(60)).await);
+}
+
+#[tokio::test]
+async fn qr_login_persists_bilibili_and_netease_cookies() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x/passport-login/web/qrcode/generate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"qrcode_key": "bili-key", "url": "https://example.com/bili-login"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/passport-login/web/qrcode/poll"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("set-cookie", "SESSDATA=session; Path=/; HttpOnly")
+                .append_header("set-cookie", "bili_jct=csrf; Path=/")
+                .set_body_json(serde_json::json!({
+                    "code": 0,
+                    "data": {"code": 0, "message": ""}
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/login/qr/key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 200, "data": {"unikey": "netease-key"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/login/qr/create"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 200, "data": {"qrurl": "https://example.com/netease-login"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/login/qr/check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 803, "cookie": "MUSIC_U=music-session; __csrf=music-csrf"
+        })))
+        .mount(&server)
+        .await;
+
+    let storage = Storage::connect("sqlite::memory:").await.unwrap();
+    let mut c = config();
+    c.bilibili_passport_base = server.uri();
+    c.netease_api_base = server.uri();
+    let credentials = RuntimeCredentials::load(storage.clone(), &c).await.unwrap();
+    let service = LoginService::new(&c, credentials.clone()).unwrap();
+
+    let bili = service.bilibili_challenge().await.unwrap();
+    assert!(bili.image.starts_with(&[0x89, b'P', b'N', b'G']));
+    assert_eq!(
+        service.poll_bilibili(&bili.key).await.unwrap(),
+        LoginPoll::Success
+    );
+    assert!(
+        credentials
+            .bilibili()
+            .await
+            .unwrap()
+            .contains("SESSDATA=session")
+    );
+    assert!(storage.get_credential("bilibili").await.unwrap().is_some());
+
+    let netease = service.netease_challenge().await.unwrap();
+    assert!(netease.image.starts_with(&[0x89, b'P', b'N', b'G']));
+    assert_eq!(
+        service.poll_netease(&netease.key).await.unwrap(),
+        LoginPoll::Success
+    );
+    assert!(
+        credentials
+            .netease()
+            .await
+            .unwrap()
+            .contains("MUSIC_U=music-session")
+    );
+    assert!(storage.get_credential("netease").await.unwrap().is_some());
 }

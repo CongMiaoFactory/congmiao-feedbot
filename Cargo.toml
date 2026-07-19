@@ -1,6 +1,6 @@
 [package]
 name = "congmiao-feedbot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 license = "GPL-3.0-only"
@@ -13,6 +13,8 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = "0.4"
 html-escape = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
 redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"], optional = true }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "cookies", "gzip", "brotli", "socks"] }

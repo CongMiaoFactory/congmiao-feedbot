@@ -3,7 +3,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::{Config, model::*};
+use crate::{Config, RuntimeCredentials, model::*};
 
 use super::{Provider, get_str, get_u64, json_response};
 
@@ -18,14 +18,24 @@ enum NeteaseKind {
 pub struct NeteaseProvider {
     client: Client,
     base: String,
+    credentials: RuntimeCredentials,
     regex: Regex,
 }
 
 impl NeteaseProvider {
     pub fn new(client: Client, config: &Config) -> Self {
+        Self::new_with_credentials(client, config, RuntimeCredentials::memory(config))
+    }
+
+    pub fn new_with_credentials(
+        client: Client,
+        config: &Config,
+        credentials: RuntimeCredentials,
+    ) -> Self {
         Self {
             client,
             base: config.netease_api_base.trim_end_matches('/').into(),
+            credentials,
             regex: Regex::new(
                 r"(?i)(?:https?://)?(?:music\.163\.com|y\.music\.163\.com|163cn\.tv)/[^\s]*",
             )
@@ -80,10 +90,15 @@ impl NeteaseProvider {
         Ok((kind, id, url))
     }
     async fn get(&self, path: &str, params: &[(&str, &str)]) -> ProviderResult<Value> {
+        let mut request = self
+            .client
+            .get(format!("{}{}", self.base, path))
+            .query(params);
+        if let Some(cookie) = self.credentials.netease().await {
+            request = request.query(&[("cookie", cookie)]);
+        }
         json_response(
-            self.client
-                .get(format!("{}{}", self.base, path))
-                .query(params)
+            request
                 .send()
                 .await
                 .map_err(|e| ProviderError::Upstream(e.to_string()))?,

@@ -19,7 +19,12 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::{
-    Config, ProviderRegistry, cache::AppCache, media::MediaProcessor, model::*, storage::Storage,
+    Config, ProviderRegistry, RuntimeCredentials,
+    cache::AppCache,
+    login::{LoginPoll, LoginService},
+    media::MediaProcessor,
+    model::*,
+    storage::Storage,
 };
 
 #[derive(Clone)]
@@ -29,6 +34,8 @@ pub struct BotState {
     pub media: MediaProcessor,
     pub storage: Storage,
     pub cache: AppCache,
+    pub login: LoginService,
+    pub credentials: RuntimeCredentials,
     pub queue: Arc<Semaphore>,
 }
 
@@ -67,7 +74,11 @@ pub async fn run(state: BotState) -> Result<()> {
 async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResult<()> {
     let text = msg.text().or_else(|| msg.caption()).unwrap_or_default();
     if text == "/start" || text == "/help" {
-        bot.send_message(msg.chat.id, "发送 X、YouTube、Pixiv、哔哩哔哩或网易云链接即可解析。\n命令：/parse、/video [清晰度]、/file、/cover") .await?;
+        bot.send_message(msg.chat.id, "发送 X、YouTube、Pixiv、哔哩哔哩或网易云链接即可解析。\n命令：/parse、/video [清晰度]、/file、/cover、/login [bili|netease]") .await?;
+        return Ok(());
+    }
+    if text.starts_with("/login") {
+        handle_login(bot, &msg, &state, text).await?;
         return Ok(());
     }
     let options = parse_options(text);
@@ -123,6 +134,129 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
     Ok(())
 }
 
+async fn handle_login(bot: Bot, msg: &Message, state: &BotState, text: &str) -> ResponseResult<()> {
+    let Some(user) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    if !msg.chat.is_private() {
+        bot.send_message(
+            msg.chat.id,
+            "为避免登录二维码泄露，请在 Bot 私聊中使用 /login。",
+        )
+        .await?;
+        return Ok(());
+    }
+    let Some(admin) = state.config.admin_user_id else {
+        bot.send_message(
+            msg.chat.id,
+            format!(
+                "当前未配置 ADMIN_USER_ID。你的 Telegram 用户 ID 是 {}。",
+                user.id.0
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+    if user.id.0 != admin {
+        bot.send_message(msg.chat.id, "你无权更新 Bot 的平台凭证。")
+            .await?;
+        return Ok(());
+    }
+
+    let target = text
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("bili")
+        .to_ascii_lowercase();
+    let (challenge, is_netease, caption) = match target.as_str() {
+        "bili" | "bilibili" | "b站" => (
+            state.login.bilibili_challenge().await,
+            false,
+            "请使用哔哩哔哩客户端扫码并确认登录，二维码约 3 分钟后过期。",
+        ),
+        "netease" | "163" | "music" | "网易云" => (
+            state.login.netease_challenge().await,
+            true,
+            "请使用网易云音乐客户端扫码并确认登录。",
+        ),
+        _ => {
+            bot.send_message(msg.chat.id, "用法：/login bili 或 /login netease")
+                .await?;
+            return Ok(());
+        }
+    };
+    let challenge = match challenge {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            bot.send_message(msg.chat.id, format!("生成登录二维码失败：{error}"))
+                .await?;
+            return Ok(());
+        }
+    };
+    bot.send_photo(
+        msg.chat.id,
+        InputFile::memory(challenge.image).file_name(if is_netease {
+            "netease-login.png"
+        } else {
+            "bilibili-login.png"
+        }),
+    )
+    .caption(caption)
+    .await?;
+
+    let chat = msg.chat.id;
+    let login = state.login.clone();
+    tokio::spawn(async move {
+        let mut scanned_notice_sent = false;
+        for _ in 0..65 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let result = if is_netease {
+                login.poll_netease(&challenge.key).await
+            } else {
+                login.poll_bilibili(&challenge.key).await
+            };
+            match result {
+                Ok(LoginPoll::Waiting) => {}
+                Ok(LoginPoll::Scanned) => {
+                    if !scanned_notice_sent {
+                        let _ = bot
+                            .send_message(chat, "已扫码，请在手机客户端中确认登录。")
+                            .await;
+                        scanned_notice_sent = true;
+                    }
+                }
+                Ok(LoginPoll::Success) => {
+                    let platform = if is_netease { "网易云" } else { "Bilibili" };
+                    let _ = bot
+                        .send_message(
+                            chat,
+                            format!("{platform} 扫码登录成功，Cookie 已持久化并立即生效。"),
+                        )
+                        .await;
+                    return;
+                }
+                Ok(LoginPoll::Expired) => {
+                    let _ = bot
+                        .send_message(chat, "登录二维码已过期，请重新发送 /login。")
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    error!(?error, "扫码登录轮询失败");
+                    let _ = bot
+                        .send_message(chat, format!("扫码登录失败：{error}"))
+                        .await;
+                    return;
+                }
+            }
+        }
+        let _ = bot
+            .send_message(chat, "登录超时，请重新发送 /login。")
+            .await;
+    });
+    Ok(())
+}
+
 async fn parse_cached(
     state: &BotState,
     requests: Vec<ParseRequest>,
@@ -134,7 +268,7 @@ async fn parse_cached(
             request.options.quality,
             request.options.file_mode,
             request.options.cover_only,
-            1
+            state.credentials.revision()
         );
         let key = format!("parsed:{}", hex::encode(Sha256::digest(raw_key.as_bytes())));
         if let Some(value) = state.cache.get(&key).await

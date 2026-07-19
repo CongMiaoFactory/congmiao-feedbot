@@ -5,13 +5,13 @@ use regex::Regex;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::{Config, model::*};
+use crate::{Config, RuntimeCredentials, model::*};
 
 use super::{Provider, filename_from_url, get_str, get_u64, json_response};
 
 pub struct BilibiliProvider {
     client: Client,
-    cookie: Option<String>,
+    credentials: RuntimeCredentials,
     api_base: String,
     live_api_base: String,
     www_base: String,
@@ -21,9 +21,17 @@ pub struct BilibiliProvider {
 
 impl BilibiliProvider {
     pub fn new(client: Client, config: &Config) -> Self {
+        Self::new_with_credentials(client, config, RuntimeCredentials::memory(config))
+    }
+
+    pub fn new_with_credentials(
+        client: Client,
+        config: &Config,
+        credentials: RuntimeCredentials,
+    ) -> Self {
         Self {
             client,
-            cookie: config.bilibili_cookie.clone(),
+            credentials,
             api_base: config.bilibili_api_base.trim_end_matches('/').into(),
             live_api_base: config.bilibili_live_api_base.trim_end_matches('/').into(),
             www_base: config.bilibili_www_base.trim_end_matches('/').into(),
@@ -40,7 +48,7 @@ impl BilibiliProvider {
             .get(url)
             .query(params)
             .header("Referer", "https://www.bilibili.com/");
-        if let Some(cookie) = &self.cookie {
+        if let Some(cookie) = self.credentials.bilibili().await {
             req = req.header("Cookie", cookie);
         }
         let value = json_response(

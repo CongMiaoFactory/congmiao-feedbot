@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use congmiao_feedbot::{
-    Config, ProviderRegistry,
+    Config, ProviderRegistry, RuntimeCredentials,
     cache::AppCache,
+    login::LoginService,
     media::MediaProcessor,
     storage::Storage,
     telegram::{BotState, run},
@@ -24,10 +25,12 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     tokio::fs::create_dir_all(&config.temp_dir).await?;
     let storage = Storage::connect(&config.database_url).await?;
+    let credentials = RuntimeCredentials::load(storage.clone(), &config).await?;
     let cache = AppCache::new(config.redis_url.as_deref()).await;
-    let registry = ProviderRegistry::new(&config)?;
+    let registry = ProviderRegistry::new_with_credentials(&config, credentials.clone())?;
+    let login = LoginService::new(&config, credentials.clone())?;
     let client = Client::builder()
-        .user_agent("CongmiaoFeedBot/0.1")
+        .user_agent(concat!("CongmiaoFeedBot/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
     let media = MediaProcessor::new(client, &config);
@@ -39,6 +42,8 @@ async fn main() -> Result<()> {
         media,
         storage,
         cache,
+        login,
+        credentials,
         queue: Arc::new(Semaphore::new(queue_size)),
     })
     .await

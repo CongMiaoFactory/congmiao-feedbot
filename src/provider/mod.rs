@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use reqwest::Client;
 
-use crate::{Config, model::*};
+use crate::{Config, RuntimeCredentials, model::*};
 
 pub use bilibili::BilibiliProvider;
 pub use netease::NeteaseProvider;
@@ -32,8 +32,19 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     pub fn new(config: &Config) -> ProviderResult<Self> {
+        Self::new_with_credentials(config, RuntimeCredentials::memory(config))
+    }
+
+    pub fn new_with_credentials(
+        config: &Config,
+        credentials: RuntimeCredentials,
+    ) -> ProviderResult<Self> {
         let client = Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; CongmiaoFeedBot/0.1; +https://github.com/congmiao-factory)")
+            .user_agent(concat!(
+                "Mozilla/5.0 (compatible; CongmiaoFeedBot/",
+                env!("CARGO_PKG_VERSION"),
+                "; +https://github.com/CongMiaoFactory/congmiao-feedbot)"
+            ))
             .redirect(reqwest::redirect::Policy::limited(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -42,8 +53,16 @@ impl ProviderRegistry {
         registry.register(XProvider::new(client.clone(), config));
         registry.register(YouTubeProvider::new(client.clone(), config));
         registry.register(PixivProvider::new(client.clone(), config));
-        registry.register(BilibiliProvider::new(client.clone(), config));
-        registry.register(NeteaseProvider::new(client, config));
+        registry.register(BilibiliProvider::new_with_credentials(
+            client.clone(),
+            config,
+            credentials.clone(),
+        ));
+        registry.register(NeteaseProvider::new_with_credentials(
+            client,
+            config,
+            credentials,
+        ));
         Ok(registry)
     }
 
