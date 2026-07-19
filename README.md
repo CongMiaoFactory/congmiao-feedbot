@@ -87,7 +87,7 @@ sudo apt-get update
 sudo apt-get install -y ffmpeg python3 python3-pip curl
 sudo pip3 install --break-system-packages -U yt-dlp
 
-VERSION=v0.2.0
+VERSION=v0.2.1
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
@@ -172,6 +172,7 @@ cargo run --release
 - `YOUTUBE_COOKIES_FILE`：yt-dlp Netscape cookie 文件路径。
 - `YOUTUBE_API_KEY`：使用官方 Data API 获取统计信息；未设置时走免费回退。
 - `PIXIV_REFRESH_TOKEN`：配置后优先使用认证 App API；未配置时使用免费 Pixiv Web API。两种路径都可将 ugoira 帧包转换为 MP4。
+- `MEDIA_SPOILER_MODE`：媒体遮罩模式，默认 `auto`。`auto` 会自动遮罩 X/Pixiv 标记为敏感或 R18 的图片、视频和动图；`always` 遮罩所有图片/视频；`off` 关闭遮罩。敏感内容即使使用 `/file` 也会按可遮罩的媒体格式发送。
 
 不要提交 `.env`、cookies 或 token。所有环境变量参见 `.env.example`。
 

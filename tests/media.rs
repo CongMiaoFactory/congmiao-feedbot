@@ -41,6 +41,7 @@ fn config(temp_dir: PathBuf) -> Config {
         webhook_host: "127.0.0.1".into(),
         webhook_port: 8080,
         admin_user_id: None,
+        media_spoiler_mode: congmiao_feedbot::MediaSpoilerMode::Auto,
     }
 }
 
@@ -126,6 +127,7 @@ async fn downloads_and_merges_dash_tracks_with_ffmpeg() {
         author: Author::default(),
         title: String::new(),
         text: String::new(),
+        sensitive: false,
         stats: Default::default(),
         media: vec![item.clone()],
         collection_items: vec![],
@@ -214,6 +216,7 @@ async fn converts_pixiv_ugoira_zip_to_mp4() {
         author: Author::default(),
         title: String::new(),
         text: String::new(),
+        sensitive: false,
         stats: Default::default(),
         media: vec![item.clone()],
         collection_items: vec![],

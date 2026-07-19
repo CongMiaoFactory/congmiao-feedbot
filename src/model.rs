@@ -91,6 +91,9 @@ pub struct ParsedContent {
     pub author: Author,
     pub title: String,
     pub text: String,
+    /// Whether the upstream marks this content as adult/sensitive.
+    #[serde(default)]
+    pub sensitive: bool,
     #[serde(default)]
     pub stats: Stats,
     #[serde(default)]

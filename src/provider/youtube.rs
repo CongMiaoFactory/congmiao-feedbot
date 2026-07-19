@@ -137,6 +137,7 @@ impl Provider for YouTubeProvider {
                 .or_else(|| get_str(y, "/description"))
                 .unwrap_or_default()
                 .to_string(),
+            sensitive: false,
             stats: Stats {
                 likes: get_u64(&data, "/statistics/likeCount")
                     .or_else(|| get_u64(y, "/like_count")),

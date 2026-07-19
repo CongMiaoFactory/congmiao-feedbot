@@ -8,7 +8,7 @@ pub mod provider;
 pub mod storage;
 pub mod telegram;
 
-pub use config::Config;
+pub use config::{Config, MediaSpoilerMode};
 pub use credentials::RuntimeCredentials;
 pub use model::*;
 pub use provider::{Provider, ProviderRegistry};

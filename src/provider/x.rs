@@ -124,6 +124,20 @@ impl Provider for XProvider {
             .and_then(Value::as_str)
             .map(|q| format!("\n\n引用：{q}"))
             .unwrap_or_default();
+        let text = format!(
+            "{}{}",
+            get_str(status, "/text").unwrap_or_default(),
+            quote_text
+        );
+        let sensitive = [
+            "/possibly_sensitive",
+            "/sensitive",
+            "/media/possibly_sensitive",
+            "/quote/possibly_sensitive",
+        ]
+        .into_iter()
+        .any(|pointer| status.pointer(pointer).and_then(Value::as_bool) == Some(true))
+            || has_adult_marker(&text);
         Ok(ParsedContent {
             platform: Platform::X,
             kind: ContentKind::Post,
@@ -150,11 +164,8 @@ impl Provider for XProvider {
                     .map(str::to_string),
             },
             title: String::new(),
-            text: format!(
-                "{}{}",
-                get_str(status, "/text").unwrap_or_default(),
-                quote_text
-            ),
+            text,
+            sensitive,
             stats: Stats {
                 likes: get_u64(status, "/likes"),
                 reposts: get_u64(status, "/reposts"),
@@ -165,4 +176,15 @@ impl Provider for XProvider {
             collection_items: Vec::new(),
         })
     }
+}
+
+fn has_adult_marker(text: &str) -> bool {
+    text.split(|c: char| c.is_whitespace() || ",，。!！?？/\\|".contains(c))
+        .map(|word| word.trim_matches('#').to_ascii_lowercase())
+        .any(|word| {
+            matches!(
+                word.as_str(),
+                "r18" | "r-18" | "r18g" | "r-18g" | "nsfw" | "18+" | "成人向"
+            )
+        })
 }

@@ -88,8 +88,12 @@ impl BilibiliProvider {
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
         Ok(response.url().to_string())
     }
-    fn headers() -> BTreeMap<String, String> {
-        BTreeMap::from([("Referer".into(), "https://www.bilibili.com/".into())])
+    async fn headers(&self) -> BTreeMap<String, String> {
+        let mut headers = BTreeMap::from([("Referer".into(), "https://www.bilibili.com/".into())]);
+        if let Some(cookie) = self.credentials.bilibili().await {
+            headers.insert("Cookie".into(), cookie);
+        }
+        headers
     }
 
     async fn parse_video(
@@ -184,11 +188,25 @@ impl BilibiliProvider {
             primary = p
                 .pointer("/dash/video")
                 .and_then(Value::as_array)
-                .and_then(|a| {
-                    a.iter()
-                        .filter(|v| get_u64(v, "/height").unwrap_or(u64::MAX) <= target)
-                        .max_by_key(|v| get_u64(v, "/height").unwrap_or_default())
-                        .or_else(|| a.last())
+                .and_then(|streams| {
+                    let within_target = || {
+                        streams.iter().filter(|stream| {
+                            get_u64(stream, "/height").unwrap_or(u64::MAX) <= target
+                        })
+                    };
+                    // Telegram 客户端对 H.264 兼容性最好，优先 AVC，再回退其他编码。
+                    within_target()
+                        .filter(|stream| {
+                            get_u64(stream, "/codecid") == Some(7)
+                                || get_str(stream, "/codecs")
+                                    .is_some_and(|codec| codec.starts_with("avc"))
+                        })
+                        .max_by_key(|stream| get_u64(stream, "/height").unwrap_or_default())
+                        .or_else(|| {
+                            within_target()
+                                .max_by_key(|stream| get_u64(stream, "/height").unwrap_or_default())
+                        })
+                        .or_else(|| streams.first())
                 })
                 .and_then(|v| get_str(v, "/baseUrl").or_else(|| get_str(v, "/base_url")))
                 .map(str::to_string);
@@ -199,6 +217,7 @@ impl BilibiliProvider {
                 .and_then(|v| get_str(v, "/baseUrl").or_else(|| get_str(v, "/base_url")))
                 .map(str::to_string);
         }
+        let media_headers = self.headers().await;
         let media = primary
             .map(|source_url| {
                 vec![MediaItem {
@@ -212,7 +231,7 @@ impl BilibiliProvider {
                     width: get_u64(data, "/dimension/width").map(|n| n as u32),
                     height: get_u64(data, "/dimension/height").map(|n| n as u32),
                     size: get_u64(p, "/durl/0/size"),
-                    headers: Self::headers(),
+                    headers: media_headers,
                     cache_key: format!("bilibili:{actual_bvid}:{qn}"),
                     requires_download: true,
                 }]
@@ -233,6 +252,7 @@ impl BilibiliProvider {
             },
             title: get_str(data, "/title").unwrap_or_default().into(),
             text: get_str(data, "/desc").unwrap_or_default().into(),
+            sensitive: false,
             stats: Stats {
                 likes: get_u64(data, "/stat/like"),
                 reposts: get_u64(data, "/stat/share"),
@@ -263,6 +283,7 @@ impl BilibiliProvider {
             .pointer("/data/anchor_info/base_info")
             .unwrap_or(&Value::Null);
         let cover = get_str(room, "/cover").or_else(|| get_str(room, "/keyframe"));
+        let media_headers = self.headers().await;
         Ok(ParsedContent {
             platform: Platform::Bilibili,
             kind: ContentKind::Live,
@@ -278,6 +299,7 @@ impl BilibiliProvider {
             },
             title: get_str(room, "/title").unwrap_or_default().into(),
             text: get_str(room, "/description").unwrap_or_default().into(),
+            sensitive: false,
             stats: Stats {
                 views: get_u64(room, "/online"),
                 ..Default::default()
@@ -294,7 +316,7 @@ impl BilibiliProvider {
                         width: None,
                         height: None,
                         size: None,
-                        headers: Self::headers(),
+                        headers: media_headers,
                         cache_key: format!("bilibili:live:{id}:cover"),
                         requires_download: false,
                         secondary_url: None,
@@ -341,7 +363,7 @@ impl BilibiliProvider {
                         width: get_u64(p, "/width").map(|n| n as u32),
                         height: get_u64(p, "/height").map(|n| n as u32),
                         size: None,
-                        headers: Self::headers(),
+                        headers: self.headers().await,
                         cache_key: format!("bilibili:opus:{id}:{i}"),
                         requires_download: false,
                         secondary_url: None,
@@ -369,6 +391,7 @@ impl BilibiliProvider {
                 .or_else(|| get_str(dynamic, "/major/opus/summary/text"))
                 .unwrap_or_default()
                 .into(),
+            sensitive: false,
             stats: Stats {
                 likes: get_u64(item, "/modules/module_stat/like/count"),
                 reposts: get_u64(item, "/modules/module_stat/forward/count"),
@@ -416,6 +439,7 @@ impl BilibiliProvider {
             },
             title: get_str(song, "/title").unwrap_or_default().into(),
             text: get_str(song, "/intro").unwrap_or_default().into(),
+            sensitive: false,
             stats: Stats {
                 replies: get_u64(song, "/comment"),
                 views: get_u64(song, "/passtime"),
@@ -431,7 +455,7 @@ impl BilibiliProvider {
                 width: None,
                 height: None,
                 size: get_u64(song, "/size"),
-                headers: Self::headers(),
+                headers: self.headers().await,
                 cache_key: format!("bilibili:audio:{id}"),
                 requires_download: true,
                 secondary_url: None,
@@ -453,6 +477,7 @@ impl BilibiliProvider {
             )
             .await?;
         let data = root.get("data").unwrap_or(&Value::Null);
+        let media_headers = self.headers().await;
         Ok(ParsedContent {
             platform: Platform::Bilibili,
             kind: ContentKind::Article,
@@ -468,6 +493,7 @@ impl BilibiliProvider {
             },
             title: get_str(data, "/title").unwrap_or_default().into(),
             text: get_str(data, "/summary").unwrap_or_default().into(),
+            sensitive: false,
             stats: Stats {
                 likes: get_u64(data, "/stats/like"),
                 replies: get_u64(data, "/stats/reply"),
@@ -486,7 +512,7 @@ impl BilibiliProvider {
                         width: None,
                         height: None,
                         size: None,
-                        headers: Self::headers(),
+                        headers: media_headers,
                         cache_key: format!("bilibili:article:{id}:cover"),
                         requires_download: false,
                         secondary_url: None,

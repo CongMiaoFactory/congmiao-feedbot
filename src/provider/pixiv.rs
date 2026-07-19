@@ -272,6 +272,15 @@ impl Provider for PixivProvider {
                     .join(" ")
             })
             .unwrap_or_default();
+        let sensitive = get_u64(body, "/xRestrict")
+            .or_else(|| get_u64(body, "/x_restrict"))
+            .is_some_and(|value| value > 0)
+            || tags.split_whitespace().any(|tag| {
+                matches!(
+                    tag.trim_start_matches('#').to_ascii_lowercase().as_str(),
+                    "r-18" | "r18" | "r-18g" | "r18g" | "nsfw" | "成人向"
+                )
+            });
         let description = get_str(body, "/description")
             .or_else(|| get_str(body, "/caption"))
             .unwrap_or_default();
@@ -292,6 +301,7 @@ impl Provider for PixivProvider {
             },
             title: get_str(body, "/title").unwrap_or_default().into(),
             text: format!("{description}\n{tags}").trim().to_string(),
+            sensitive,
             stats: Stats {
                 likes: get_u64(body, "/likeCount").or_else(|| get_u64(body, "/bookmarkCount")),
                 views: get_u64(body, "/viewCount"),

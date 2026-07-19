@@ -19,7 +19,7 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::{
-    Config, ProviderRegistry, RuntimeCredentials,
+    Config, MediaSpoilerMode, ProviderRegistry, RuntimeCredentials,
     cache::AppCache,
     login::{LoginPoll, LoginService},
     media::MediaProcessor,
@@ -301,6 +301,7 @@ async fn send_content(
 ) -> Result<()> {
     let _queue = state.queue.acquire().await?;
     let caption_text = caption(&content, 1024);
+    let spoiler = media_has_spoiler(&state.config, &content);
     if content.media.is_empty() {
         bot.send_message(msg.chat.id, caption(&content, 4096))
             .parse_mode(ParseMode::Html)
@@ -320,6 +321,7 @@ async fn send_content(
     if selected.is_empty() {
         if let Some(url) = content.media.iter().find_map(|m| m.thumbnail_url.clone()) {
             bot.send_photo(msg.chat.id, InputFile::url(url.parse()?))
+                .has_spoiler(spoiler)
                 .caption(caption_text)
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -354,16 +356,20 @@ async fn send_content(
                     None
                 };
                 group.push(match item.kind {
-                    MediaKind::Video => InputMedia::Video(
-                        InputMediaVideo::new(input)
+                    MediaKind::Video => {
+                        let mut media = InputMediaVideo::new(input)
                             .caption(c.unwrap_or_default())
-                            .parse_mode(ParseMode::Html),
-                    ),
-                    _ => InputMedia::Photo(
-                        InputMediaPhoto::new(input)
+                            .parse_mode(ParseMode::Html);
+                        media.has_spoiler = spoiler;
+                        InputMedia::Video(media)
+                    }
+                    _ => {
+                        let mut media = InputMediaPhoto::new(input)
                             .caption(c.unwrap_or_default())
-                            .parse_mode(ParseMode::Html),
-                    ),
+                            .parse_mode(ParseMode::Html);
+                        media.has_spoiler = spoiler;
+                        InputMedia::Photo(media)
+                    }
                 });
             }
             let sent = bot.send_media_group(msg.chat.id, group).await?;
@@ -394,6 +400,7 @@ async fn send_content(
                 item,
                 file_id,
                 if index == 0 { &caption_text } else { "" },
+                spoiler,
             )
             .await?;
             continue;
@@ -411,15 +418,24 @@ async fn send_content(
                     &p.path,
                     if index == 0 { &caption_text } else { "" },
                     options.file_mode,
+                    spoiler,
                 )
                 .await?
             }
             Err(err) => {
                 warn!(?err, "媒体准备失败，回退到预览");
                 if index == 0 {
-                    bot.send_message(msg.chat.id, &caption_text)
-                        .parse_mode(ParseMode::Html)
-                        .await?
+                    if let Some(thumbnail) = &item.thumbnail_url {
+                        bot.send_photo(msg.chat.id, InputFile::url(thumbnail.parse()?))
+                            .has_spoiler(spoiler)
+                            .caption(&caption_text)
+                            .parse_mode(ParseMode::Html)
+                            .await?
+                    } else {
+                        bot.send_message(msg.chat.id, &caption_text)
+                            .parse_mode(ParseMode::Html)
+                            .await?
+                    }
                 } else {
                     continue;
                 }
@@ -463,9 +479,12 @@ async fn send_local(
     path: &std::path::Path,
     caption: &str,
     document: bool,
+    spoiler: bool,
 ) -> Result<Message> {
     let input = InputFile::file(path.to_path_buf()).file_name(item.filename.clone());
-    let req = if document || item.kind == MediaKind::Document {
+    // Telegram documents cannot carry a spoiler. Sensitive visual media stays
+    // photo/video/animation even when /file was requested.
+    let req = if (document && !spoiler) || item.kind == MediaKind::Document {
         bot.send_document(chat, input)
             .caption(caption)
             .parse_mode(ParseMode::Html)
@@ -474,12 +493,14 @@ async fn send_local(
         match item.kind {
             MediaKind::Photo => {
                 bot.send_photo(chat, input)
+                    .has_spoiler(spoiler)
                     .caption(caption)
                     .parse_mode(ParseMode::Html)
                     .await?
             }
             MediaKind::Video => {
                 bot.send_video(chat, input)
+                    .has_spoiler(spoiler)
                     .caption(caption)
                     .parse_mode(ParseMode::Html)
                     .supports_streaming(true)
@@ -493,6 +514,7 @@ async fn send_local(
             }
             MediaKind::Animation => {
                 bot.send_animation(chat, input)
+                    .has_spoiler(spoiler)
                     .caption(caption)
                     .parse_mode(ParseMode::Html)
                     .await?
@@ -509,17 +531,20 @@ async fn send_cached(
     item: &MediaItem,
     id: String,
     caption: &str,
+    spoiler: bool,
 ) -> Result<Message> {
     let input = InputFile::file_id(teloxide::types::FileId(id));
     Ok(match item.kind {
         MediaKind::Photo => {
             bot.send_photo(chat, input)
+                .has_spoiler(spoiler)
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?
         }
         MediaKind::Video => {
             bot.send_video(chat, input)
+                .has_spoiler(spoiler)
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?
@@ -532,6 +557,7 @@ async fn send_cached(
         }
         MediaKind::Animation => {
             bot.send_animation(chat, input)
+                .has_spoiler(spoiler)
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?
@@ -606,6 +632,11 @@ async fn inline_result(state: &BotState, content: &ParsedContent) -> InlineQuery
         content.title.clone()
     };
     let caption_text = caption(content, 1024);
+    // Inline media results have no spoiler flag in Telegram Bot API. Use a text
+    // article instead so sensitive media is never inserted without a mask.
+    if media_has_spoiler(&state.config, content) {
+        return article_result(content, title);
+    }
     if let Some(item) = content.media.first() {
         if let Ok(Some(file_id)) = state
             .storage
@@ -671,6 +702,24 @@ async fn inline_result(state: &BotState, content: &ParsedContent) -> InlineQuery
     article_result(content, title)
 }
 
+pub fn media_has_spoiler(config: &Config, content: &ParsedContent) -> bool {
+    if !content.media.iter().any(|item| {
+        matches!(
+            item.kind,
+            MediaKind::Photo | MediaKind::Video | MediaKind::Animation
+        )
+    }) {
+        return false;
+    }
+    match config.media_spoiler_mode {
+        MediaSpoilerMode::Always => true,
+        MediaSpoilerMode::Off => false,
+        MediaSpoilerMode::Auto => {
+            content.sensitive && matches!(content.platform, Platform::X | Platform::Pixiv)
+        }
+    }
+}
+
 fn article_result(content: &ParsedContent, title: String) -> InlineQueryResult {
     InlineQueryResult::Article(InlineQueryResultArticle::new(
         content.id.clone(),
@@ -730,62 +779,98 @@ fn parse_options(text: &str) -> ParseOptions {
 }
 
 pub fn caption(content: &ParsedContent, max: usize) -> String {
+    let title = ellipsize(&content.title, (max * 15 / 100).clamp(60, 300));
+    let source = if title.is_empty() {
+        content.platform.as_str().to_string()
+    } else {
+        format!("{}：{title}", content.platform.as_str())
+    };
     let mut parts = vec![format!(
         "<a href=\"{}\">{}</a>",
         html_escape::encode_double_quoted_attribute(&content.canonical_url),
-        html_escape::encode_text(content.platform.as_str())
+        html_escape::encode_text(&source)
     )];
-    if !content.author.name.is_empty() {
-        let author = html_escape::encode_text(&content.author.name);
-        parts.push(
-            content
-                .author
-                .url
-                .as_ref()
-                .map(|u| {
-                    format!(
-                        "<a href=\"{}\">@{author}</a>",
-                        html_escape::encode_double_quoted_attribute(u)
-                    )
-                })
-                .unwrap_or_else(|| format!("@{author}")),
-        );
-    }
-    if !content.title.is_empty() {
-        parts.push(format!(
-            "<b>{}</b>",
-            html_escape::encode_text(&content.title)
-        ));
-    }
-    if !content.text.is_empty() {
-        parts.push(html_escape::encode_text(&content.text).to_string());
-    }
+
+    let mut summary = content.text.clone();
     if !content.collection_items.is_empty() {
-        parts.push(
-            content
+        if !summary.is_empty() {
+            summary.push_str("\n\n");
+        }
+        summary.push_str(
+            &content
                 .collection_items
                 .iter()
                 .take(30)
                 .enumerate()
-                .map(|(i, s)| format!("{}. {}", i + 1, html_escape::encode_text(s)))
+                .map(|(i, item)| format!("{}. {item}", i + 1))
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
     }
+    if !summary.is_empty() {
+        let summary = ellipsize(&summary, (max * 35 / 100).clamp(180, 1800));
+        parts.push(format!(
+            "<blockquote>{}</blockquote>",
+            html_escape::encode_text(&summary)
+        ));
+    }
+
+    if !content.author.name.is_empty() {
+        let author_name = ellipsize(&content.author.name, (max * 10 / 100).clamp(40, 160));
+        let author = html_escape::encode_text(&author_name);
+        let author = content
+            .author
+            .url
+            .as_ref()
+            .map(|url| {
+                format!(
+                    "<a href=\"{}\">{author}</a>",
+                    html_escape::encode_double_quoted_attribute(url)
+                )
+            })
+            .unwrap_or_else(|| author.to_string());
+        parts.push(format!("作者：{author}"));
+    }
+
+    let view_label = match content.platform {
+        Platform::Bilibili | Platform::YouTube => "播放",
+        _ => "浏览",
+    };
     let stats = [
-        ("👁", content.stats.views),
-        ("❤", content.stats.likes),
-        ("↻", content.stats.reposts),
-        ("💬", content.stats.replies),
+        (view_label, content.stats.views),
+        ("点赞", content.stats.likes),
+        ("分享", content.stats.reposts),
+        ("评论", content.stats.replies),
     ]
     .into_iter()
-    .filter_map(|(n, v)| v.map(|v| format!("{n} {v}")))
+    .filter_map(|(name, value)| value.map(|value| format!("{name} {}", format_count(value))))
     .collect::<Vec<_>>()
-    .join("  ");
+    .join("　");
     if !stats.is_empty() {
-        parts.push(stats);
+        parts.push(format!("<blockquote>{stats}</blockquote>"));
     }
-    truncate_html(&parts.join("\n\n"), max)
+    truncate_html(&parts.join("\n"), max)
+}
+
+fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut value = text.chars().take(max.saturating_sub(1)).collect::<String>();
+    value.push('…');
+    value
+}
+
+fn format_count(value: u64) -> String {
+    let raw = value.to_string();
+    let mut formatted = String::with_capacity(raw.len() + raw.len() / 3);
+    for (index, ch) in raw.chars().enumerate() {
+        if index > 0 && (raw.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+    formatted
 }
 
 fn truncate_html(text: &str, max: usize) -> String {

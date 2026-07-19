@@ -2,6 +2,28 @@ use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSpoilerMode {
+    Auto,
+    Always,
+    Off,
+}
+
+impl MediaSpoilerMode {
+    fn from_env() -> Self {
+        match env::var("MEDIA_SPOILER_MODE")
+            .unwrap_or_else(|_| "auto".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "always" | "on" | "true" | "1" => Self::Always,
+            "off" | "false" | "0" => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub telegram_token: String,
@@ -32,6 +54,7 @@ pub struct Config {
     pub webhook_host: String,
     pub webhook_port: u16,
     pub admin_user_id: Option<u64>,
+    pub media_spoiler_mode: MediaSpoilerMode,
 }
 
 impl Config {
@@ -77,6 +100,7 @@ impl Config {
             webhook_host: env::var("WEBHOOK_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             webhook_port: parse("WEBHOOK_PORT", 8080),
             admin_user_id: value("ADMIN_USER_ID").and_then(|v| v.parse().ok()),
+            media_spoiler_mode: MediaSpoilerMode::from_env(),
         })
     }
 }

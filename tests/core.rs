@@ -7,7 +7,7 @@ use congmiao_feedbot::{
     login::{LoginPoll, LoginService},
     provider::{BilibiliProvider, NeteaseProvider, PixivProvider, XProvider},
     storage::Storage,
-    telegram::{caption, extract_urls},
+    telegram::{caption, extract_urls, media_has_spoiler},
 };
 use reqwest::Client;
 use wiremock::{
@@ -45,6 +45,7 @@ fn config() -> Config {
         webhook_host: "127.0.0.1".into(),
         webhook_port: 8080,
         admin_user_id: None,
+        media_spoiler_mode: congmiao_feedbot::MediaSpoilerMode::Auto,
     }
 }
 
@@ -89,6 +90,7 @@ fn caption_is_escaped_and_bounded() {
         },
         title: "<b>not html</b>".into(),
         text: "x".repeat(5000),
+        sensitive: false,
         stats: Default::default(),
         media: vec![],
         collection_items: vec![],
@@ -97,13 +99,16 @@ fn caption_is_escaped_and_bounded() {
     assert!(value.chars().count() <= 1024);
     assert!(!value.contains("<Alice>"));
     assert!(value.contains("https://x.com/a/status/1"));
+    assert!(value.contains("x：&lt;b&gt;not html&lt;/b&gt;"));
+    assert!(value.contains("<blockquote>"));
+    assert!(value.contains("作者："));
 }
 
 #[tokio::test]
 async fn x_provider_deserializes_post_and_media() {
     let server = MockServer::start().await;
     Mock::given(method("GET")).and(path("/2/status/123456789012"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":200,"status":{"id":"123456789012","url":"https://x.com/a/status/123456789012","text":"hello","likes":7,"author":{"id":"9","name":"Alice","screen_name":"a"},"media":{"photos":[{"type":"photo","url":"https://img.test/a.jpg","width":100,"height":80}],"videos":[]}}}))).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":200,"status":{"id":"123456789012","url":"https://x.com/a/status/123456789012","text":"hello","possibly_sensitive":true,"likes":7,"author":{"id":"9","name":"Alice","screen_name":"a"},"media":{"photos":[{"type":"photo","url":"https://img.test/a.jpg","width":100,"height":80}],"videos":[]}}}))).mount(&server).await;
     let mut c = config();
     c.fxtwitter_api_base = server.uri();
     let provider = XProvider::new(Client::new(), &c);
@@ -117,13 +122,15 @@ async fn x_provider_deserializes_post_and_media() {
     assert_eq!(parsed.author.name, "Alice");
     assert_eq!(parsed.stats.likes, Some(7));
     assert_eq!(parsed.media.len(), 1);
+    assert!(parsed.sensitive);
+    assert!(media_has_spoiler(&c, &parsed));
 }
 
 #[tokio::test]
 async fn pixiv_provider_supports_multiple_pages() {
     let server = MockServer::start().await;
     Mock::given(method("GET")).and(path("/ajax/illust/123")).and(query_param("lang", "zh"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":{"title":"work","userId":"5","userName":"Artist","pageCount":2,"tags":{"tags":[{"tag":"tag"}]}}}))).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":{"title":"work","userId":"5","userName":"Artist","pageCount":2,"xRestrict":1,"tags":{"tags":[{"tag":"R-18"}]}}}))).mount(&server).await;
     Mock::given(method("GET")).and(path("/ajax/illust/123/pages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":[{"urls":{"original":"https://i.pximg.net/1.jpg"}},{"urls":{"original":"https://i.pximg.net/2.jpg"}}]}))).mount(&server).await;
     let mut c = config();
@@ -137,7 +144,9 @@ async fn pixiv_provider_supports_multiple_pages() {
         .unwrap();
     assert_eq!(parsed.media.len(), 2);
     assert_eq!(parsed.author.name, "Artist");
-    assert!(parsed.text.contains("#tag"));
+    assert!(parsed.text.contains("#R-18"));
+    assert!(parsed.sensitive);
+    assert!(media_has_spoiler(&c, &parsed));
 }
 
 #[tokio::test]
@@ -227,7 +236,7 @@ async fn bilibili_provider_parses_video_and_dash_streams() {
     Mock::given(method("GET")).and(path("/x/web-interface/view"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"bvid":"BV1xx411c7mD","cid":42,"title":"Bili video","desc":"desc","pic":"https://img/cover.jpg","duration":12,"owner":{"mid":1,"name":"UP"},"dimension":{"width":1280,"height":720},"stat":{"view":100,"like":5}}}))).mount(&server).await;
     Mock::given(method("GET")).and(path("/x/player/playurl"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"dash":{"video":[{"baseUrl":"https://media/video.m4s","height":720}],"audio":[{"baseUrl":"https://media/audio.m4s"}]}}}))).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"dash":{"video":[{"baseUrl":"https://media/hevc.m4s","height":720,"codecid":12},{"baseUrl":"https://media/video.m4s","height":720,"codecid":7}],"audio":[{"baseUrl":"https://media/audio.m4s"}]}}}))).mount(&server).await;
     let mut c = config();
     c.bilibili_api_base = server.uri();
     c.bilibili_live_api_base = server.uri();
@@ -241,6 +250,7 @@ async fn bilibili_provider_parses_video_and_dash_streams() {
         .unwrap();
     assert_eq!(parsed.title, "Bili video");
     assert_eq!(parsed.author.name, "UP");
+    assert_eq!(parsed.media[0].source_url, "https://media/video.m4s");
     assert_eq!(
         parsed.media[0].secondary_url.as_deref(),
         Some("https://media/audio.m4s")

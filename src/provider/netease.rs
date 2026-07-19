@@ -153,6 +153,7 @@ impl Provider for NeteaseProvider {
                     },
                     title: get_str(song, "/name").unwrap_or_default().into(),
                     text: get_str(song, "/al/name").unwrap_or_default().into(),
+                    sensitive: false,
                     stats: Default::default(),
                     media: vec![MediaItem {
                         kind: MediaKind::Audio,
@@ -216,6 +217,7 @@ impl Provider for NeteaseProvider {
                     },
                     title: get_str(mv, "/name").unwrap_or_default().into(),
                     text: get_str(mv, "/desc").unwrap_or_default().into(),
+                    sensitive: false,
                     stats: Stats {
                         views: get_u64(mv, "/playCount"),
                         ..Default::default()
@@ -292,6 +294,7 @@ impl NeteaseProvider {
             author: Default::default(),
             title: get_str(&root, name_ptr).unwrap_or_default().into(),
             text: String::new(),
+            sensitive: false,
             stats: Default::default(),
             media: if cover.is_empty() {
                 vec![]
