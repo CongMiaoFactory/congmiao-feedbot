@@ -1,6 +1,6 @@
 services:
   feedbot:
-    build: .
+    image: ${FEEDBOT_IMAGE:-ghcr.io/congmiaofactory/congmiao-feedbot:latest}
     restart: unless-stopped
     env_file: .env
     environment:
@@ -34,4 +34,3 @@ services:
 volumes:
   feedbot-data:
   redis-data:
-

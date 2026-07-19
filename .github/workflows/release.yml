@@ -1,0 +1,40 @@
+name: Release Linux x64
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux x64 musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build Linux x64 release
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Package release
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p package
+          cp target/x86_64-unknown-linux-musl/release/congmiao-feedbot package/
+          cp README.md LICENSE .env.example package/
+          tar -C package -czf "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz" .
+          sha256sum "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz" > "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            congmiao-feedbot-${{ github.ref_name }}-linux-x86_64.tar.gz
+            congmiao-feedbot-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256

@@ -25,35 +25,125 @@
 
 默认视频选择 H.264/AAC 且不高于 720p。超过 Telegram 大小限制时会用 FFmpeg 压缩；仍超限则退回文本和原链接。成功上传的 `file_id` 存入 SQLite，重复发送不再下载。
 
-## 本地运行
+## 快速启动：Docker Compose（推荐）
 
-要求 Rust 1.90+、FFmpeg 和 yt-dlp。网易云功能要求可访问的 `api-enhanced` 服务。
-
-```powershell
-Copy-Item .env.example .env
-# 编辑 .env，至少填写 TELEGRAM_BOT_TOKEN
-$env:TELEGRAM_BOT_TOKEN="..."
-$env:NETEASE_API_BASE="http://127.0.0.1:3000"
-cargo run --release
-```
-
-未设置 `WEBHOOK_URL` 时使用 Polling；设置后监听 `WEBHOOK_HOST:WEBHOOK_PORT` 并向 Telegram 注册该地址。
-
-## Docker Compose
+Docker 镜像发布到 `ghcr.io/congmiaofactory/congmiao-feedbot`，不需要在服务器上编译 Rust。
 
 ```bash
+git clone https://github.com/CongMiaoFactory/congmiao-feedbot.git
+cd congmiao-feedbot
 cp .env.example .env
-# 填入 TELEGRAM_BOT_TOKEN
-docker compose up -d --build
+mkdir -p secrets
+nano .env
+```
+
+至少填写：
+
+```env
+TELEGRAM_BOT_TOKEN=1234567890:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+然后拉取镜像并启动：
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose logs -f feedbot
+```
+
+更新：
+
+```bash
+git pull
+docker compose pull
+docker compose up -d
 ```
 
 启用 Redis：
 
 ```bash
-REDIS_URL=redis://redis:6379 docker compose --profile redis up -d --build
+sed -i 's|# REDIS_URL=|REDIS_URL=redis://redis:6379|' .env
+docker compose --profile redis up -d
 ```
 
-`api-enhanced` 作为独立容器运行，版本可通过 `NETEASE_API_IMAGE` 覆盖。Bot 即使暂时无法连接 Redis 或某个 Provider，上述其他 Provider 仍可工作。
+Compose 会自动启动网易云 API sidecar，并在容器内将 `NETEASE_API_BASE` 设为 `http://netease-api:3000`。可通过 `NETEASE_API_IMAGE` 覆盖 sidecar 镜像。
+
+## Linux x64 Release 启动
+
+GitHub Release 提供静态链接的 `x86_64-unknown-linux-musl` 程序。运行时仍需要 FFmpeg 和 yt-dlp。
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg python3 python3-pip curl
+sudo pip3 install --break-system-packages -U yt-dlp
+
+VERSION=v0.1.0
+curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
+curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
+sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
+
+mkdir congmiao-feedbot
+tar -xzf "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz" -C congmiao-feedbot
+cd congmiao-feedbot
+cp .env.example .env
+nano .env
+chmod +x congmiao-feedbot
+set -a
+source .env
+set +a
+./congmiao-feedbot
+```
+
+非 Docker 方式需要自行启动网易云 sidecar，并保持：
+
+```env
+NETEASE_API_BASE=http://127.0.0.1:3000
+```
+
+### systemd 守护进程
+
+将解压后的目录移到 `/opt/congmiao-feedbot`，然后创建 `/etc/systemd/system/congmiao-feedbot.service`：
+
+```ini
+[Unit]
+Description=Congmiao Telegram FeedBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=feedbot
+Group=feedbot
+WorkingDirectory=/opt/congmiao-feedbot
+EnvironmentFile=/opt/congmiao-feedbot/.env
+ExecStart=/opt/congmiao-feedbot/congmiao-feedbot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo useradd --system --home /opt/congmiao-feedbot --shell /usr/sbin/nologin feedbot
+sudo chown -R feedbot:feedbot /opt/congmiao-feedbot
+sudo systemctl daemon-reload
+sudo systemctl enable --now congmiao-feedbot
+sudo journalctl -u congmiao-feedbot -f
+```
+
+未设置 `WEBHOOK_URL` 时默认使用 Polling，不需要公网端口或 HTTPS。在群聊中自动解析时，还需在 BotFather 中通过 `/setprivacy` 关闭 Privacy Mode。
+
+## 从源码运行
+
+要求 Rust 1.90+、FFmpeg 和 yt-dlp。
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少填写 TELEGRAM_BOT_TOKEN
+set -a && source .env && set +a
+cargo run --release
+```
 
 ## 凭证
 

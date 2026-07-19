@@ -1,0 +1,17 @@
+.git
+.github
+.agents
+.codex
+target
+telegram-bili-feed-helper
+data
+tmp
+logs
+secrets
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.log
