@@ -90,7 +90,7 @@ pub async fn run(state: BotState) -> Result<()> {
 async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResult<()> {
     let text = msg.text().or_else(|| msg.caption()).unwrap_or_default();
     if text == "/start" || text == "/help" {
-        bot.send_message(msg.chat.id, "发送 X、YouTube、Pixiv、哔哩哔哩或网易云链接即可解析。\n命令：/parse、/video [清晰度]、/file、/cover、/login [bili|netease]") .await?;
+        bot.send_message(msg.chat.id, "发送 X、YouTube、Pixiv、哔哩哔哩或网易云链接即可解析；在链接后加 +sp 可手动开启媒体遮罩。\n命令：/parse、/video [清晰度]、/file、/cover、/login [bili|netease]") .await?;
         return Ok(());
     }
     if text.starts_with("/login") {
@@ -98,7 +98,20 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
         return Ok(());
     }
     let options = parse_options(text);
-    let urls = extract_message_urls(&msg);
+    let mut urls = extract_message_urls(&msg);
+    if options.force_spoiler {
+        for url in &mut urls {
+            if url.to_ascii_lowercase().ends_with("+sp") {
+                url.truncate(url.len() - 3);
+            }
+        }
+    }
+    if urls.is_empty()
+        && options.force_spoiler
+        && let Some(replied) = msg.reply_to_message()
+    {
+        urls = extract_message_urls(replied);
+    }
     if urls.is_empty() {
         if msg.chat.is_private() && text.starts_with('/') {
             bot.send_message(msg.chat.id, "未找到支持的链接").await?;
@@ -317,7 +330,8 @@ async fn send_content(
 ) -> Result<()> {
     let _queue = state.queue.acquire().await?;
     let caption_text = caption(&content, 1024);
-    let spoiler = media_has_spoiler(&state.config, &content);
+    let spoiler = media_has_spoiler(&state.config, &content)
+        || (options.force_spoiler && has_visual_media(&content));
     if content.media.is_empty() {
         bot.send_message(msg.chat.id, caption(&content, 4096))
             .reply_parameters(ReplyParameters::new(msg.id))
@@ -802,12 +816,7 @@ async fn inline_result(state: &BotState, content: &ParsedContent) -> InlineQuery
 }
 
 pub fn media_has_spoiler(config: &Config, content: &ParsedContent) -> bool {
-    if !content.media.iter().any(|item| {
-        matches!(
-            item.kind,
-            MediaKind::Photo | MediaKind::Video | MediaKind::Animation
-        )
-    }) {
+    if !has_visual_media(content) {
         return false;
     }
     match config.media_spoiler_mode {
@@ -817,6 +826,15 @@ pub fn media_has_spoiler(config: &Config, content: &ParsedContent) -> bool {
             content.sensitive && matches!(content.platform, Platform::X | Platform::Pixiv)
         }
     }
+}
+
+fn has_visual_media(content: &ParsedContent) -> bool {
+    content.media.iter().any(|item| {
+        matches!(
+            item.kind,
+            MediaKind::Photo | MediaKind::Video | MediaKind::Animation
+        )
+    })
 }
 
 fn article_result(content: &ParsedContent, title: String) -> InlineQueryResult {
@@ -867,6 +885,12 @@ fn extract_message_urls(msg: &Message) -> Vec<String> {
 
 fn parse_options(text: &str) -> ParseOptions {
     let lower = text.to_ascii_lowercase();
+    let force_spoiler = lower
+        .split_whitespace()
+        .any(|value| value == "+sp" || value == "/spoiler" || value == "/mask")
+        || lower.ends_with("+sp")
+        || lower.starts_with("/spoiler")
+        || lower.starts_with("/mask");
     ParseOptions {
         quality: Regex::new(r"(?i)(360|480|720|1080)p?")
             .ok()
@@ -874,6 +898,7 @@ fn parse_options(text: &str) -> ParseOptions {
             .and_then(|c| c[1].parse().ok()),
         file_mode: lower.starts_with("/file"),
         cover_only: lower.starts_with("/cover"),
+        force_spoiler,
     }
 }
 

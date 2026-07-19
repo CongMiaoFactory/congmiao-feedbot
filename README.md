@@ -21,6 +21,7 @@
 - `/video [360p|480p|720p|1080p] <url>`：指定视频上限，默认 720p。
 - `/file <url>`：以文件形式发送媒体。
 - `/cover <url>`：只发送封面（来源提供封面时）。
+- 在链接后添加 `+sp`：手动为本次图片、视频和动图添加遮罩，例如 `https://www.pixiv.net/artworks/123456 +sp`。也可回复一条含链接的消息后单独发送 `+sp`。
 - `/login bili`：管理员私聊扫码登录 Bilibili，并立即更新持久化 Cookie。
 - `/login netease`：管理员私聊扫码登录网易云音乐，并立即更新持久化 Cookie。
 - 启用 BotFather Inline Mode 后，可通过 `@botname <url>` 生成解析预览。
@@ -112,7 +113,7 @@ sudo apt-get update
 sudo apt-get install -y ffmpeg python3 python3-pip curl
 sudo pip3 install --break-system-packages -U yt-dlp
 
-VERSION=v0.2.4
+VERSION=v0.2.5
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"

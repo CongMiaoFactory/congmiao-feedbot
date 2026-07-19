@@ -107,6 +107,7 @@ pub struct ParseOptions {
     pub quality: Option<u32>,
     pub file_mode: bool,
     pub cover_only: bool,
+    pub force_spoiler: bool,
 }
 
 #[derive(Debug, Clone)]
