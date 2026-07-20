@@ -26,7 +26,7 @@
 - `/login netease`：管理员私聊扫码登录网易云音乐，并立即更新持久化 Cookie。
 - 启用 BotFather Inline Mode 后，可通过 `@botname <url>` 生成解析预览。
 
-默认视频选择 H.264/AAC 且不高于 720p。超过 Telegram 大小限制时会用 FFmpeg 压缩；仍超限则退回文本和原链接。成功上传的 `file_id` 存入 SQLite，重复发送不再下载。
+默认视频选择 H.264/AAC 且不高于 720p；Bilibili 会根据码率和时长在下载前自动降到可上传的 480p/360p。媒体下载支持可配置长超时、指数退避重试、HTTP Range 续传、Bilibili 备用地址和完整长度校验。超过 Telegram 大小限制时会用 FFmpeg 压缩；仍超限则退回文本和原链接。成功上传的 `file_id` 存入 SQLite，重复发送不再下载。较长简介使用 Telegram 可展开引用显示，超出 caption 硬限制的部分仍会安全省略。
 
 ## 快速启动：Docker Compose（推荐）
 
@@ -102,7 +102,7 @@ docker compose logs -f telegram-bot-api feedbot
 
 `telegram-bot-api` 仅将 `8081` 端口绑定到宿主机的 `127.0.0.1`，feedbot 通过 Compose 内部服务名访问。数据保存在 `telegram-bot-api-data` volume。恢复官方 Telegram Bot API 时，清空 `TELEGRAM_API_URL`、设置 `LOCAL_MODE=false`，再执行普通的 `docker compose up -d`。
 
-本地 Bot API 处理大媒体时可能超过 teloxide 默认的短请求时限，项目默认将 Telegram 请求超时设为 600 秒，可用 `TELEGRAM_REQUEST_TIMEOUT_SECS` 调整。
+本地 Bot API 处理大媒体时可能超过 teloxide 默认的短请求时限，项目默认将 Telegram 请求超时设为 600 秒，可用 `TELEGRAM_REQUEST_TIMEOUT_SECS` 调整。上游媒体单次下载超时默认也是 600 秒，可用 `MEDIA_DOWNLOAD_TIMEOUT_SECS` 调整；失败后默认重试 3 次并尝试 Range 续传，可用 `MEDIA_DOWNLOAD_RETRIES` 调整。
 
 ## Linux x64 Release 启动
 

@@ -20,6 +20,8 @@ fn config() -> Config {
         telegram_token: "test".into(),
         telegram_api_url: None,
         telegram_request_timeout_secs: 600,
+        media_download_timeout_secs: 600,
+        media_download_retries: 3,
         database_url: "sqlite::memory:".into(),
         redis_url: None,
         fxtwitter_api_base: "https://api.fxtwitter.com".into(),
@@ -81,7 +83,7 @@ fn extracts_and_deduplicates_urls() {
 
 #[test]
 fn caption_is_escaped_and_bounded() {
-    let content = congmiao_feedbot::ParsedContent {
+    let mut content = congmiao_feedbot::ParsedContent {
         platform: Platform::X,
         kind: ContentKind::Post,
         id: "1".into(),
@@ -102,8 +104,13 @@ fn caption_is_escaped_and_bounded() {
     assert!(!value.contains("<Alice>"));
     assert!(value.contains("https://x.com/a/status/1"));
     assert!(value.contains("x：&lt;b&gt;not html&lt;/b&gt;"));
-    assert!(value.contains("<blockquote>"));
+    assert!(value.contains("<blockquote expandable>"));
     assert!(value.contains("作者："));
+
+    content.text = "short description".into();
+    let value = caption(&content, 1024);
+    assert!(value.contains("<blockquote>short description</blockquote>"));
+    assert!(!value.contains("<blockquote expandable>"));
 }
 
 #[tokio::test]
@@ -126,6 +133,65 @@ async fn x_provider_deserializes_post_and_media() {
     assert_eq!(parsed.media.len(), 1);
     assert!(parsed.sensitive);
     assert!(media_has_spoiler(&c, &parsed));
+}
+
+#[tokio::test]
+async fn x_provider_selects_h264_source_at_or_below_requested_quality() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2/status/123456789012"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 200,
+            "status": {
+                "id": "123456789012",
+                "url": "https://x.com/a/status/123456789012",
+                "author": {"id": "9", "name": "Alice", "screen_name": "a"},
+                "media": {"photos": [], "videos": [{
+                    "type": "video",
+                    "url": "https://video.twimg.com/vid/avc1/1920x1080/high.mp4",
+                    "duration": 15,
+                    "width": 1920,
+                    "height": 1080,
+                    "formats": [
+                        {"container": "mp4", "codec": "h264", "bitrate": 832000, "url": "https://video.twimg.com/vid/avc1/640x360/low.mp4"},
+                        {"container": "mp4", "codec": "h264", "bitrate": 2176000, "url": "https://video.twimg.com/vid/avc1/1280x720/medium.mp4"},
+                        {"container": "mp4", "codec": "h264", "bitrate": 5000000, "url": "https://video.twimg.com/vid/avc1/1920x1080/high.mp4"},
+                        {"container": "m3u8", "url": "https://video.twimg.com/video.m3u8"}
+                    ]
+                }]}
+            }
+        })))
+        .mount(&server)
+        .await;
+    let mut c = config();
+    c.fxtwitter_api_base = server.uri();
+    let provider = XProvider::new(Client::new(), &c);
+    let parsed = provider
+        .parse(&ParseRequest {
+            url: "https://x.com/a/status/123456789012".into(),
+            options: ParseOptions::default(),
+        })
+        .await
+        .unwrap();
+    assert!(parsed.media[0].source_url.contains("1280x720"));
+    assert_eq!(parsed.media[0].width, Some(1280));
+    assert_eq!(parsed.media[0].height, Some(720));
+    assert_eq!(parsed.media[0].duration_secs, Some(15));
+    assert_eq!(parsed.media[0].size, Some(4_080_000));
+    assert!(parsed.media[0].cache_key.ends_with(":720p"));
+
+    let parsed = provider
+        .parse(&ParseRequest {
+            url: "https://x.com/a/status/123456789012".into(),
+            options: ParseOptions {
+                quality: Some(480),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert!(parsed.media[0].source_url.contains("640x360"));
+    assert!(parsed.media[0].cache_key.ends_with(":480p"));
 }
 
 #[tokio::test]
@@ -240,7 +306,7 @@ async fn bilibili_provider_parses_video_and_dash_streams() {
     Mock::given(method("GET")).and(path("/x/web-interface/view"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"bvid":"BV1xx411c7mD","cid":42,"title":"Bili video","desc":"desc","pic":"https://img/cover.jpg","duration":12,"owner":{"mid":1,"name":"UP"},"dimension":{"width":1280,"height":720},"stat":{"view":100,"like":5}}}))).mount(&server).await;
     Mock::given(method("GET")).and(path("/x/player/playurl"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"dash":{"video":[{"baseUrl":"https://media/hevc.m4s","height":720,"codecid":12},{"baseUrl":"https://media/video.m4s","height":720,"codecid":7}],"audio":[{"baseUrl":"https://media/audio.m4s"}]}}}))).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"dash":{"duration":12,"video":[{"baseUrl":"https://media/hevc.m4s","width":1280,"height":720,"bandwidth":40000000,"codecid":12},{"baseUrl":"https://media/video-720.m4s","width":1280,"height":720,"bandwidth":40000000,"codecid":7},{"baseUrl":"https://media/video-480.m4s","backupUrl":["https://backup/video-480.m4s"],"width":854,"height":480,"bandwidth":1000000,"codecid":7}],"audio":[{"baseUrl":"https://media/audio.m4s","bandwidth":128000}]}}}))).mount(&server).await;
     let mut c = config();
     c.bilibili_api_base = server.uri();
     c.bilibili_live_api_base = server.uri();
@@ -254,7 +320,13 @@ async fn bilibili_provider_parses_video_and_dash_streams() {
         .unwrap();
     assert_eq!(parsed.title, "Bili video");
     assert_eq!(parsed.author.name, "UP");
-    assert_eq!(parsed.media[0].source_url, "https://media/video.m4s");
+    assert_eq!(parsed.media[0].source_url, "https://media/video-480.m4s");
+    assert_eq!(
+        parsed.media[0].fallback_urls,
+        ["https://backup/video-480.m4s"]
+    );
+    assert_eq!(parsed.media[0].width, Some(854));
+    assert_eq!(parsed.media[0].height, Some(480));
     assert_eq!(
         parsed.media[0].secondary_url.as_deref(),
         Some("https://media/audio.m4s")

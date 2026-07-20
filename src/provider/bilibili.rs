@@ -15,6 +15,7 @@ pub struct BilibiliProvider {
     api_base: String,
     live_api_base: String,
     www_base: String,
+    max_media_size: u64,
     matcher: Regex,
     bvid: Regex,
 }
@@ -35,6 +36,11 @@ impl BilibiliProvider {
             api_base: config.bilibili_api_base.trim_end_matches('/').into(),
             live_api_base: config.bilibili_live_api_base.trim_end_matches('/').into(),
             www_base: config.bilibili_www_base.trim_end_matches('/').into(),
+            max_media_size: if config.local_bot_api {
+                2_000_000_000
+            } else {
+                50 * 1024 * 1024
+            },
             matcher: Regex::new(
                 r"(?i)(?:bilibili\.com|b23\.tv|(?:^|\s)BV[0-9A-Za-z]{10}|(?:^|\s)av\d+)",
             )
@@ -182,34 +188,67 @@ impl BilibiliProvider {
             .await?;
         let p = play.get("data").unwrap_or(&Value::Null);
         let mut primary = get_str(p, "/durl/0/url").map(str::to_string);
+        let mut fallback_urls = string_array(p.pointer("/durl/0/backup_url"));
         let mut secondary = None;
+        let mut selected_width = None;
+        let mut selected_height = None;
+        let mut selected_size = get_u64(p, "/durl/0/size");
         if primary.is_none() {
             let target = options.quality.unwrap_or(720) as u64;
-            primary = p
-                .pointer("/dash/video")
-                .and_then(Value::as_array)
-                .and_then(|streams| {
-                    let within_target = || {
-                        streams.iter().filter(|stream| {
-                            get_u64(stream, "/height").unwrap_or(u64::MAX) <= target
-                        })
-                    };
-                    // Telegram 客户端对 H.264 兼容性最好，优先 AVC，再回退其他编码。
-                    within_target()
-                        .filter(|stream| {
-                            get_u64(stream, "/codecid") == Some(7)
-                                || get_str(stream, "/codecs")
-                                    .is_some_and(|codec| codec.starts_with("avc"))
-                        })
-                        .max_by_key(|stream| get_u64(stream, "/height").unwrap_or_default())
-                        .or_else(|| {
-                            within_target()
-                                .max_by_key(|stream| get_u64(stream, "/height").unwrap_or_default())
-                        })
-                        .or_else(|| streams.first())
-                })
-                .and_then(|v| get_str(v, "/baseUrl").or_else(|| get_str(v, "/base_url")))
-                .map(str::to_string);
+            let duration = get_u64(p, "/dash/duration").or_else(|| get_u64(data, "/duration"));
+            let audio_bandwidth = get_u64(p, "/dash/audio/0/bandwidth").unwrap_or_default();
+            let selected_video =
+                p.pointer("/dash/video")
+                    .and_then(Value::as_array)
+                    .and_then(|streams| {
+                        let within_target = || {
+                            streams.iter().filter(|stream| {
+                                get_u64(stream, "/height").unwrap_or(u64::MAX) <= target
+                                    && estimated_stream_size(stream, audio_bandwidth, duration)
+                                        .is_none_or(|size| size <= self.max_media_size)
+                            })
+                        };
+                        // Telegram 客户端对 H.264 兼容性最好，优先 AVC，再回退其他编码。
+                        within_target()
+                            .filter(|stream| {
+                                get_u64(stream, "/codecid") == Some(7)
+                                    || get_str(stream, "/codecs")
+                                        .is_some_and(|codec| codec.starts_with("avc"))
+                            })
+                            .max_by_key(|stream| get_u64(stream, "/height").unwrap_or_default())
+                            .or_else(|| {
+                                within_target().max_by_key(|stream| {
+                                    get_u64(stream, "/height").unwrap_or_default()
+                                })
+                            })
+                            .or_else(|| {
+                                streams
+                                    .iter()
+                                    .filter(|stream| {
+                                        get_u64(stream, "/codecid") == Some(7)
+                                            || get_str(stream, "/codecs")
+                                                .is_some_and(|codec| codec.starts_with("avc"))
+                                    })
+                                    .min_by_key(|stream| {
+                                        get_u64(stream, "/height").unwrap_or(u64::MAX)
+                                    })
+                            })
+                            .or_else(|| {
+                                streams.iter().min_by_key(|stream| {
+                                    get_u64(stream, "/height").unwrap_or(u64::MAX)
+                                })
+                            })
+                    });
+            if let Some(stream) = selected_video {
+                primary = get_str(stream, "/baseUrl")
+                    .or_else(|| get_str(stream, "/base_url"))
+                    .map(str::to_string);
+                fallback_urls =
+                    string_array(stream.get("backupUrl").or_else(|| stream.get("backup_url")));
+                selected_width = get_u64(stream, "/width").map(|value| value as u32);
+                selected_height = get_u64(stream, "/height").map(|value| value as u32);
+                selected_size = get_u64(stream, "/size");
+            }
             secondary = p
                 .pointer("/dash/audio")
                 .and_then(Value::as_array)
@@ -217,22 +256,26 @@ impl BilibiliProvider {
                 .and_then(|v| get_str(v, "/baseUrl").or_else(|| get_str(v, "/base_url")))
                 .map(str::to_string);
         }
+        let selected_quality = selected_height.unwrap_or(options.quality.unwrap_or(720));
         let media_headers = self.headers().await;
         let media = primary
             .map(|source_url| {
                 vec![MediaItem {
                     kind: MediaKind::Video,
                     source_url,
+                    fallback_urls,
                     secondary_url: secondary,
                     thumbnail_url: get_str(data, "/pic").map(str::to_string),
                     filename: format!("bilibili-{actual_bvid}.mp4"),
                     mime_type: Some("video/mp4".into()),
                     duration_secs: get_u64(data, "/duration"),
-                    width: get_u64(data, "/dimension/width").map(|n| n as u32),
-                    height: get_u64(data, "/dimension/height").map(|n| n as u32),
-                    size: get_u64(p, "/durl/0/size"),
+                    width: selected_width
+                        .or_else(|| get_u64(data, "/dimension/width").map(|n| n as u32)),
+                    height: selected_height
+                        .or_else(|| get_u64(data, "/dimension/height").map(|n| n as u32)),
+                    size: selected_size,
                     headers: media_headers,
-                    cache_key: format!("bilibili:{actual_bvid}:{qn}"),
+                    cache_key: format!("bilibili:{actual_bvid}:{qn}:{selected_quality}p"),
                     requires_download: true,
                 }]
             })
@@ -309,6 +352,7 @@ impl BilibiliProvider {
                     vec![MediaItem {
                         kind: MediaKind::Photo,
                         source_url: u.into(),
+                        fallback_urls: vec![],
                         thumbnail_url: None,
                         filename: format!("bilibili-live-{id}.jpg"),
                         mime_type: None,
@@ -356,6 +400,7 @@ impl BilibiliProvider {
                     media.push(MediaItem {
                         kind: MediaKind::Photo,
                         source_url: u.into(),
+                        fallback_urls: vec![],
                         thumbnail_url: None,
                         filename: filename_from_url(u, &format!("bilibili-opus-{id}-{i}.jpg")),
                         mime_type: None,
@@ -448,6 +493,7 @@ impl BilibiliProvider {
             media: vec![MediaItem {
                 kind: MediaKind::Audio,
                 source_url: source.into(),
+                fallback_urls: vec![],
                 thumbnail_url: get_str(song, "/cover").map(str::to_string),
                 filename: format!("bilibili-au{id}.m4a"),
                 mime_type: Some("audio/mp4".into()),
@@ -505,6 +551,7 @@ impl BilibiliProvider {
                     vec![MediaItem {
                         kind: MediaKind::Photo,
                         source_url: u.into(),
+                        fallback_urls: vec![],
                         thumbnail_url: None,
                         filename: format!("bilibili-cv{id}.jpg"),
                         mime_type: None,
@@ -522,6 +569,31 @@ impl BilibiliProvider {
             collection_items: Vec::new(),
         })
     }
+}
+
+fn estimated_stream_size(
+    stream: &Value,
+    audio_bandwidth: u64,
+    duration_secs: Option<u64>,
+) -> Option<u64> {
+    let duration_secs = duration_secs?;
+    let video_bandwidth = get_u64(stream, "/bandwidth")?;
+    Some(
+        video_bandwidth
+            .saturating_add(audio_bandwidth)
+            .saturating_mul(duration_secs)
+            / 8,
+    )
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 #[async_trait]

@@ -1,4 +1,13 @@
-use std::path::PathBuf;
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
 
 use congmiao_feedbot::{
     Author, Config, ContentKind, MediaItem, MediaKind, ParsedContent, Platform,
@@ -16,6 +25,8 @@ fn config(temp_dir: PathBuf) -> Config {
         telegram_token: "test".into(),
         telegram_api_url: None,
         telegram_request_timeout_secs: 600,
+        media_download_timeout_secs: 600,
+        media_download_retries: 3,
         database_url: "sqlite::memory:".into(),
         redis_url: None,
         fxtwitter_api_base: String::new(),
@@ -57,6 +68,78 @@ fn validates_telegram_photo_dimensions() {
 }
 
 #[tokio::test]
+async fn interrupted_download_resumes_with_http_range() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let resumed = Arc::new(AtomicBool::new(false));
+    let resumed_for_server = resumed.clone();
+    let server = thread::spawn(move || {
+        for request_number in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..length]);
+            if request_number == 0 {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello",
+                    )
+                    .unwrap();
+            } else {
+                assert!(request.contains("range: bytes=5-"));
+                resumed_for_server.store(true, Ordering::SeqCst);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 5-9/10\r\nConnection: close\r\n\r\nworld",
+                    )
+                    .unwrap();
+            }
+        }
+    });
+    let item = MediaItem {
+        kind: MediaKind::Document,
+        source_url: format!("http://{address}/resume"),
+        fallback_urls: vec![],
+        thumbnail_url: None,
+        filename: "resume.bin".into(),
+        mime_type: Some("application/octet-stream".into()),
+        duration_secs: None,
+        width: None,
+        height: None,
+        size: Some(10),
+        headers: Default::default(),
+        cache_key: "test:resume".into(),
+        requires_download: true,
+        secondary_url: None,
+    };
+    let content = ParsedContent {
+        platform: Platform::Bilibili,
+        kind: ContentKind::Post,
+        id: "resume".into(),
+        canonical_url: "https://example.com/resume".into(),
+        author: Author::default(),
+        title: String::new(),
+        text: String::new(),
+        sensitive: false,
+        stats: Default::default(),
+        media: vec![item.clone()],
+        collection_items: vec![],
+    };
+    let output_dir = tempfile::tempdir().unwrap();
+    let mut test_config = config(output_dir.path().into());
+    test_config.media_download_retries = 1;
+    let processor = MediaProcessor::new(Client::new(), &test_config);
+    let prepared = processor.prepare(&content, &item, 720).await.unwrap();
+    server.join().unwrap();
+    assert!(resumed.load(Ordering::SeqCst));
+    assert_eq!(
+        tokio::fs::read(&prepared.path).await.unwrap(),
+        b"helloworld"
+    );
+    processor.cleanup(prepared).await;
+}
+
+#[tokio::test]
 async fn oversized_photo_dimensions_force_document_mode() {
     if Command::new("ffmpeg")
         .arg("-version")
@@ -94,6 +177,7 @@ async fn oversized_photo_dimensions_force_document_mode() {
     let item = MediaItem {
         kind: MediaKind::Photo,
         source_url: format!("{}/tall.jpg", server.uri()),
+        fallback_urls: vec![],
         thumbnail_url: None,
         filename: "tall.jpg".into(),
         mime_type: Some("image/jpeg".into()),
@@ -188,6 +272,7 @@ async fn downloads_and_merges_dash_tracks_with_ffmpeg() {
     let item = MediaItem {
         kind: MediaKind::Video,
         source_url: format!("{}/v", server.uri()),
+        fallback_urls: vec![],
         thumbnail_url: None,
         filename: "merged.mp4".into(),
         mime_type: Some("video/mp4".into()),
@@ -298,6 +383,7 @@ async fn converts_pixiv_ugoira_zip_to_mp4() {
     let item = MediaItem {
         kind: MediaKind::Animation,
         source_url: format!("{}/u.zip", server.uri()),
+        fallback_urls: vec![],
         thumbnail_url: None,
         filename: "ugoira.mp4".into(),
         mime_type: Some("video/mp4".into()),

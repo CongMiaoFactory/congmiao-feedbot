@@ -222,6 +222,7 @@ impl Provider for PixivProvider {
             media.push(MediaItem {
                 kind: MediaKind::Animation,
                 source_url: zip_url.into(),
+                fallback_urls: vec![],
                 thumbnail_url: get_str(body, "/image_urls/large").map(str::to_string),
                 filename: format!("pixiv-{id}-ugoira.mp4"),
                 mime_type: Some("video/mp4".into()),
@@ -244,6 +245,7 @@ impl Provider for PixivProvider {
             media.push(MediaItem {
                 kind: MediaKind::Photo,
                 source_url: url.clone(),
+                fallback_urls: vec![],
                 thumbnail_url: None,
                 filename: filename_from_url(&url, &format!("pixiv-{id}-p{index}.jpg")),
                 mime_type: None,

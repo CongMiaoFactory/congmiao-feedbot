@@ -29,6 +29,8 @@ pub struct Config {
     pub telegram_token: String,
     pub telegram_api_url: Option<String>,
     pub telegram_request_timeout_secs: u64,
+    pub media_download_timeout_secs: u64,
+    pub media_download_retries: usize,
     pub database_url: String,
     pub redis_url: Option<String>,
     pub fxtwitter_api_base: String,
@@ -68,6 +70,8 @@ impl Config {
             telegram_token,
             telegram_api_url: value("TELEGRAM_API_URL"),
             telegram_request_timeout_secs: parse("TELEGRAM_REQUEST_TIMEOUT_SECS", 600),
+            media_download_timeout_secs: parse("MEDIA_DOWNLOAD_TIMEOUT_SECS", 600),
+            media_download_retries: parse("MEDIA_DOWNLOAD_RETRIES", 3),
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://data/feedbot.db?mode=rwc".to_string()),
             redis_url: value("REDIS_URL"),

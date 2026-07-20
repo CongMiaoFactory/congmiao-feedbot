@@ -59,6 +59,8 @@ pub enum MediaKind {
 pub struct MediaItem {
     pub kind: MediaKind,
     pub source_url: String,
+    #[serde(default)]
+    pub fallback_urls: Vec<String>,
     pub thumbnail_url: Option<String>,
     pub filename: String,
     pub mime_type: Option<String>,

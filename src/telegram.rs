@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use teloxide::{
@@ -380,14 +380,7 @@ async fn send_content(
             let mut group = Vec::new();
             let mut prepared = Vec::new();
             for (i, item) in chunk.iter().enumerate() {
-                let input = input_for_item(
-                    state,
-                    &content,
-                    item,
-                    options.quality.unwrap_or(720),
-                    &mut prepared,
-                )
-                .await?;
+                let input = input_for_item(state, &content, item, options, &mut prepared).await?;
                 let c = if i == 0 {
                     Some(caption_text.clone())
                 } else {
@@ -463,10 +456,7 @@ async fn send_content(
             .await?;
             continue;
         }
-        let prepared = state
-            .media
-            .prepare(&content, item, options.quality.unwrap_or(720))
-            .await;
+        let prepared = prepare_media_with_refresh(state, &content, item, options).await;
         let prepared_thumbnail = if matches!(item.kind, MediaKind::Audio | MediaKind::Video) {
             if let Some(url) = &item.thumbnail_url {
                 match state.media.prepare_thumbnail(url, &item.cache_key).await {
@@ -534,11 +524,57 @@ async fn send_content(
     Ok(())
 }
 
+async fn prepare_media_with_refresh(
+    state: &BotState,
+    content: &ParsedContent,
+    item: &MediaItem,
+    options: &ParseOptions,
+) -> Result<crate::media::PreparedMedia> {
+    let quality = options.quality.unwrap_or(720);
+    match state.media.prepare(content, item, quality).await {
+        Ok(prepared) => Ok(prepared),
+        Err(initial_error) => {
+            warn!(
+                error = %initial_error,
+                url = %content.canonical_url,
+                "媒体准备失败，重新解析上游地址后再试"
+            );
+            let refreshed = state
+                .registry
+                .parse_one(ParseRequest {
+                    url: content.canonical_url.clone(),
+                    options: options.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    anyhow!("重新解析媒体地址失败: {error}; 初始错误: {initial_error}")
+                })?;
+            let refreshed_item = refreshed
+                .media
+                .iter()
+                .find(|candidate| candidate.cache_key == item.cache_key)
+                .or_else(|| {
+                    refreshed.media.iter().find(|candidate| {
+                        candidate.kind == item.kind && candidate.filename == item.filename
+                    })
+                })
+                .ok_or_else(|| anyhow!("重新解析后未找到对应媒体；初始错误: {initial_error}"))?;
+            state
+                .media
+                .prepare(&refreshed, refreshed_item, quality)
+                .await
+                .map_err(|error| {
+                    anyhow!("刷新地址后媒体准备仍失败: {error}; 初始错误: {initial_error}")
+                })
+        }
+    }
+}
+
 async fn input_for_item(
     state: &BotState,
     content: &ParsedContent,
     item: &MediaItem,
-    quality: u32,
+    options: &ParseOptions,
     prepared: &mut Vec<crate::media::PreparedMedia>,
 ) -> Result<InputFile> {
     if let Some(id) = state
@@ -551,7 +587,7 @@ async fn input_for_item(
     if !item.requires_download && item.headers.is_empty() {
         return Ok(InputFile::url(item.source_url.parse()?));
     }
-    let p = state.media.prepare(content, item, quality).await?;
+    let p = prepare_media_with_refresh(state, content, item, options).await?;
     let input = InputFile::file(p.path.clone());
     prepared.push(p);
     Ok(input)
@@ -971,9 +1007,11 @@ pub fn caption(content: &ParsedContent, max: usize) -> String {
         );
     }
     if !summary.is_empty() {
+        let expandable = summary.chars().count() > 300;
         let summary = ellipsize(&summary, (max * 35 / 100).clamp(180, 1800));
+        let attribute = if expandable { " expandable" } else { "" };
         parts.push(format!(
-            "<blockquote>{}</blockquote>",
+            "<blockquote{attribute}>{}</blockquote>",
             html_escape::encode_text(&summary)
         ));
     }

@@ -31,7 +31,10 @@ async fn main() -> Result<()> {
     let login = LoginService::new(&config, credentials.clone())?;
     let client = Client::builder()
         .user_agent(concat!("CongmiaoFeedBot/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(
+            config.media_download_timeout_secs,
+        ))
         .build()?;
     let media = MediaProcessor::new(client, &config);
     let queue_size = config.max_queue_size.max(1);

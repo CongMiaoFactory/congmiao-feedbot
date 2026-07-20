@@ -109,6 +109,7 @@ impl Provider for YouTubeProvider {
         let media = vec![MediaItem {
             kind: MediaKind::Video,
             source_url: canonical.clone(),
+            fallback_urls: vec![],
             thumbnail_url: thumbnail,
             filename: format!("youtube-{id}.mp4"),
             mime_type: Some("video/mp4".into()),

@@ -1,6 +1,6 @@
 [package]
 name = "congmiao-feedbot"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.90"
 license = "GPL-3.0-only"
@@ -25,7 +25,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 teloxide = { version = "0.17", default-features = false, features = ["macros", "ctrlc_handler", "rustls", "webhooks-axum", "throttle"] }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"

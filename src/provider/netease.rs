@@ -160,6 +160,7 @@ impl Provider for NeteaseProvider {
                     media: vec![MediaItem {
                         kind: MediaKind::Audio,
                         source_url: media_url.into(),
+                        fallback_urls: vec![],
                         thumbnail_url: cover,
                         filename: song_filename(&title, &id, audio_format),
                         mime_type: Some(if audio_format == "mp3" {
@@ -229,6 +230,7 @@ impl Provider for NeteaseProvider {
                     media: vec![MediaItem {
                         kind: MediaKind::Video,
                         source_url: media_url.into(),
+                        fallback_urls: vec![],
                         thumbnail_url: get_str(mv, "/cover").map(str::to_string),
                         filename: format!("netease-mv-{id}.mp4"),
                         mime_type: Some("video/mp4".into()),
@@ -330,6 +332,7 @@ impl NeteaseProvider {
                 vec![MediaItem {
                     kind: MediaKind::Photo,
                     source_url: cover.into(),
+                    fallback_urls: vec![],
                     thumbnail_url: None,
                     filename: format!("netease-collection-{id}.jpg"),
                     mime_type: Some("image/jpeg".into()),
