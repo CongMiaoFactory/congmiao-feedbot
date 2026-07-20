@@ -121,6 +121,7 @@ impl Provider for YouTubeProvider {
             cache_key: format!("youtube:{id}:{}p", request.options.quality.unwrap_or(720)),
             requires_download: true,
             secondary_url: None,
+            secondary_fallback_urls: vec![],
         }];
         Ok(ParsedContent {
             platform: Platform::YouTube,

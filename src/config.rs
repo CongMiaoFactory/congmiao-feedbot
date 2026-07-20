@@ -3,6 +3,49 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BilibiliCdnPreference {
+    BaseUrl,
+    BackupUrl,
+    Mirror(&'static str),
+}
+
+impl BilibiliCdnPreference {
+    fn from_env() -> Result<Self> {
+        let value = env::var("BILIBILI_CDN")
+            .unwrap_or_else(|_| "baseUrl".into())
+            .trim()
+            .to_ascii_lowercase();
+        let preference = match value.as_str() {
+            "baseurl" | "base" => Self::BaseUrl,
+            "backupurl" | "backup" => Self::BackupUrl,
+            "ali" => Self::Mirror("upos-sz-mirrorali.bilivideo.com"),
+            "alib" => Self::Mirror("upos-sz-mirroralib.bilivideo.com"),
+            "alio1" => Self::Mirror("upos-sz-mirroralio1.bilivideo.com"),
+            "cos" => Self::Mirror("upos-sz-mirrorcos.bilivideo.com"),
+            "cosb" => Self::Mirror("upos-sz-mirrorcosb.bilivideo.com"),
+            "coso1" => Self::Mirror("upos-sz-mirrorcoso1.bilivideo.com"),
+            "hw" => Self::Mirror("upos-sz-mirrorhw.bilivideo.com"),
+            "hwb" => Self::Mirror("upos-sz-mirrorhwb.bilivideo.com"),
+            "hwo1" => Self::Mirror("upos-sz-mirrorhwo1.bilivideo.com"),
+            "08c" | "hw_08c" => Self::Mirror("upos-sz-mirror08c.bilivideo.com"),
+            "08h" | "hw_08h" => Self::Mirror("upos-sz-mirror08h.bilivideo.com"),
+            "08ct" | "hw_08ct" => Self::Mirror("upos-sz-mirror08ct.bilivideo.com"),
+            "tf_hw" => Self::Mirror("upos-tf-all-hw.bilivideo.com"),
+            "tf_tx" => Self::Mirror("upos-tf-all-tx.bilivideo.com"),
+            "akamai" => Self::Mirror("upos-hz-mirrorakam.akamaized.net"),
+            "aliov" => Self::Mirror("upos-sz-mirroraliov.bilivideo.com"),
+            "cosov" => Self::Mirror("upos-sz-mirrorcosov.bilivideo.com"),
+            "hwov" => Self::Mirror("upos-sz-mirrorhwov.bilivideo.com"),
+            "hk_bcache" => Self::Mirror("cn-hk-eq-bcache-01.bilivideo.com"),
+            _ => anyhow::bail!(
+                "BILIBILI_CDN 不支持 {value:?}；可用 baseUrl、backupUrl、ali、cos、hw、akamai 等"
+            ),
+        };
+        Ok(preference)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaSpoilerMode {
     Auto,
     Always,
@@ -41,6 +84,7 @@ pub struct Config {
     pub youtube_cookies_file: Option<PathBuf>,
     pub pixiv_refresh_token: Option<String>,
     pub bilibili_cookie: Option<String>,
+    pub bilibili_cdn: BilibiliCdnPreference,
     pub bilibili_passport_base: String,
     pub bilibili_api_base: String,
     pub bilibili_live_api_base: String,
@@ -70,7 +114,7 @@ impl Config {
             telegram_token,
             telegram_api_url: value("TELEGRAM_API_URL"),
             telegram_request_timeout_secs: parse("TELEGRAM_REQUEST_TIMEOUT_SECS", 600),
-            media_download_timeout_secs: parse("MEDIA_DOWNLOAD_TIMEOUT_SECS", 600),
+            media_download_timeout_secs: parse("MEDIA_DOWNLOAD_TIMEOUT_SECS", 120).max(1),
             media_download_retries: parse("MEDIA_DOWNLOAD_RETRIES", 3),
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://data/feedbot.db?mode=rwc".to_string()),
@@ -87,6 +131,7 @@ impl Config {
             youtube_cookies_file: value("YOUTUBE_COOKIES_FILE").map(PathBuf::from),
             pixiv_refresh_token: value("PIXIV_REFRESH_TOKEN"),
             bilibili_cookie: value("BILIBILI_COOKIE"),
+            bilibili_cdn: BilibiliCdnPreference::from_env()?,
             bilibili_passport_base: env::var("BILIBILI_PASSPORT_BASE")
                 .unwrap_or_else(|_| "https://passport.bilibili.com".into()),
             bilibili_api_base: env::var("BILIBILI_API_BASE")

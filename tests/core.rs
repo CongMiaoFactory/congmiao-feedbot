@@ -20,7 +20,7 @@ fn config() -> Config {
         telegram_token: "test".into(),
         telegram_api_url: None,
         telegram_request_timeout_secs: 600,
-        media_download_timeout_secs: 600,
+        media_download_timeout_secs: 120,
         media_download_retries: 3,
         database_url: "sqlite::memory:".into(),
         redis_url: None,
@@ -32,6 +32,7 @@ fn config() -> Config {
         youtube_cookies_file: None,
         pixiv_refresh_token: None,
         bilibili_cookie: None,
+        bilibili_cdn: congmiao_feedbot::BilibiliCdnPreference::BaseUrl,
         bilibili_passport_base: "https://passport.bilibili.com".into(),
         bilibili_api_base: "https://api.bilibili.com".into(),
         bilibili_live_api_base: "https://api.live.bilibili.com".into(),
@@ -306,7 +307,7 @@ async fn bilibili_provider_parses_video_and_dash_streams() {
     Mock::given(method("GET")).and(path("/x/web-interface/view"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"bvid":"BV1xx411c7mD","cid":42,"title":"Bili video","desc":"desc","pic":"https://img/cover.jpg","duration":12,"owner":{"mid":1,"name":"UP"},"dimension":{"width":1280,"height":720},"stat":{"view":100,"like":5}}}))).mount(&server).await;
     Mock::given(method("GET")).and(path("/x/player/playurl"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"dash":{"duration":12,"video":[{"baseUrl":"https://media/hevc.m4s","width":1280,"height":720,"bandwidth":40000000,"codecid":12},{"baseUrl":"https://media/video-720.m4s","width":1280,"height":720,"bandwidth":40000000,"codecid":7},{"baseUrl":"https://media/video-480.m4s","backupUrl":["https://backup/video-480.m4s"],"width":854,"height":480,"bandwidth":1000000,"codecid":7}],"audio":[{"baseUrl":"https://media/audio.m4s","bandwidth":128000}]}}}))).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0,"data":{"dash":{"duration":12,"video":[{"baseUrl":"https://media/hevc.m4s","width":1280,"height":720,"bandwidth":40000000,"codecid":12},{"baseUrl":"https://media/video-720.m4s","width":1280,"height":720,"bandwidth":40000000,"codecid":7},{"baseUrl":"https://media/video-480.m4s","backupUrl":["https://backup/video-480.m4s"],"width":854,"height":480,"bandwidth":1000000,"codecid":7}],"audio":[{"baseUrl":"https://media/audio.m4s","backupUrl":["https://backup/audio.m4s"],"bandwidth":128000}]}}}))).mount(&server).await;
     let mut c = config();
     c.bilibili_api_base = server.uri();
     c.bilibili_live_api_base = server.uri();
@@ -330,6 +331,52 @@ async fn bilibili_provider_parses_video_and_dash_streams() {
     assert_eq!(
         parsed.media[0].secondary_url.as_deref(),
         Some("https://media/audio.m4s")
+    );
+    assert_eq!(
+        parsed.media[0].secondary_fallback_urls,
+        ["https://backup/audio.m4s"]
+    );
+
+    c.bilibili_cdn = congmiao_feedbot::BilibiliCdnPreference::BackupUrl;
+    let backup_first = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "BV1xx411c7mD".into(),
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        backup_first.media[0].source_url,
+        "https://backup/video-480.m4s"
+    );
+    assert_eq!(
+        backup_first.media[0].fallback_urls,
+        ["https://media/video-480.m4s"]
+    );
+
+    c.bilibili_cdn =
+        congmiao_feedbot::BilibiliCdnPreference::Mirror("upos-sz-mirrorali.bilivideo.com");
+    let mirrored = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "BV1xx411c7mD".into(),
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        mirrored.media[0].source_url,
+        "https://upos-sz-mirrorali.bilivideo.com/video-480.m4s"
+    );
+    assert_eq!(
+        mirrored.media[0].fallback_urls,
+        [
+            "https://media/video-480.m4s",
+            "https://backup/video-480.m4s"
+        ]
+    );
+    assert_eq!(
+        mirrored.media[0].secondary_url.as_deref(),
+        Some("https://upos-sz-mirrorali.bilivideo.com/audio.m4s")
     );
 }
 

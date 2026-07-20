@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -29,6 +30,23 @@ use crate::{
 };
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct MediaTooLarge {
+    max_size: u64,
+}
+
+impl fmt::Display for MediaTooLarge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "媒体超过 {}MB 上传限制",
+            self.max_size / 1024 / 1024
+        )
+    }
+}
+
+impl std::error::Error for MediaTooLarge {}
 
 #[derive(Debug)]
 pub struct PreparedMedia {
@@ -113,7 +131,13 @@ impl MediaProcessor {
         let safe = unique_temp_key(cache_key);
         let source = self.temp_dir.join(format!("{safe}-cover.part"));
         let output = self.temp_dir.join(format!("{safe}-cover.jpg"));
-        self.download(url, &source, &Default::default()).await?;
+        self.download(
+            url,
+            &source,
+            &Default::default(),
+            self.max_size.min(50 * 1024 * 1024),
+        )
+        .await?;
         let result = Command::new(&self.ffmpeg)
             .arg("-y")
             .arg("-i")
@@ -159,6 +183,11 @@ impl MediaProcessor {
         let output = self
             .temp_dir
             .join(format!("{safe}-{}", sanitize(&item.filename)));
+        let download_limit = if matches!(item.kind, MediaKind::Video | MediaKind::Animation) {
+            2_000_000_000
+        } else {
+            self.max_size
+        };
         if item.kind == MediaKind::Animation
             && item
                 .secondary_url
@@ -171,6 +200,7 @@ impl MediaProcessor {
                 &item.fallback_urls,
                 &archive,
                 &item.headers,
+                download_limit,
             )
             .await?;
             let conversion = self
@@ -192,12 +222,20 @@ impl MediaProcessor {
                 &item.fallback_urls,
                 &primary,
                 &item.headers,
+                download_limit,
             )
             .await?;
             if let Some(second_url) = &item.secondary_url {
                 let secondary = self.temp_dir.join(format!("{safe}.part2"));
                 let preparation = async {
-                    self.download(second_url, &secondary, &item.headers).await?;
+                    self.download_with_fallbacks(
+                        second_url,
+                        &item.secondary_fallback_urls,
+                        &secondary,
+                        &item.headers,
+                        download_limit,
+                    )
+                    .await?;
                     self.merge(&primary, &secondary, &output).await
                 }
                 .await;
@@ -268,12 +306,16 @@ impl MediaProcessor {
         fallback_urls: &[String],
         target: &Path,
         headers: &std::collections::BTreeMap<String, String>,
+        download_limit: u64,
     ) -> Result<()> {
         let mut last_error = None;
         for url in std::iter::once(primary_url).chain(fallback_urls.iter().map(String::as_str)) {
-            match self.download(url, target, headers).await {
+            match self.download(url, target, headers, download_limit).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    if error.downcast_ref::<MediaTooLarge>().is_some() {
+                        return Err(error);
+                    }
                     warn!(host = %url_host(url), error = %error, "媒体地址下载失败，尝试备用地址");
                     last_error = Some(error);
                 }
@@ -287,13 +329,21 @@ impl MediaProcessor {
         url: &str,
         target: &Path,
         headers: &std::collections::BTreeMap<String, String>,
+        download_limit: u64,
     ) -> Result<()> {
         let attempts = self.download_retries.saturating_add(1);
         let mut last_error = None;
         for attempt in 1..=attempts {
-            match self.download_attempt(url, target, headers, attempt).await {
+            match self
+                .download_attempt(url, target, headers, attempt, download_limit)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    if error.downcast_ref::<MediaTooLarge>().is_some() {
+                        let _ = tokio::fs::remove_file(target).await;
+                        return Err(error);
+                    }
                     let downloaded = tokio::fs::metadata(target)
                         .await
                         .map(|metadata| metadata.len())
@@ -323,6 +373,7 @@ impl MediaProcessor {
         target: &Path,
         headers: &std::collections::BTreeMap<String, String>,
         attempt: usize,
+        download_limit: u64,
     ) -> Result<()> {
         let existing = tokio::fs::metadata(target)
             .await
@@ -358,8 +409,11 @@ impl MediaProcessor {
                     .content_length()
                     .map(|length| base.saturating_add(length))
             });
-        if expected_total.is_some_and(|total| total > 2_000_000_000) {
-            bail!("拒绝下载超过 2GB 的文件");
+        if expected_total.is_some_and(|total| total > download_limit) {
+            return Err(MediaTooLarge {
+                max_size: download_limit,
+            }
+            .into());
         }
         let mut file = if resumed {
             OpenOptions::new().append(true).open(target).await?
@@ -379,8 +433,11 @@ impl MediaProcessor {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             total = total.saturating_add(chunk.len() as u64);
-            if total > 2_000_000_000 {
-                bail!("拒绝下载超过 2GB 的文件");
+            if total > download_limit {
+                return Err(MediaTooLarge {
+                    max_size: download_limit,
+                }
+                .into());
             }
             file.write_all(&chunk).await?;
         }

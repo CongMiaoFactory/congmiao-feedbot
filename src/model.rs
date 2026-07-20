@@ -74,6 +74,8 @@ pub struct MediaItem {
     #[serde(default)]
     pub requires_download: bool,
     pub secondary_url: Option<String>,
+    #[serde(default)]
+    pub secondary_fallback_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

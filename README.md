@@ -102,7 +102,7 @@ docker compose logs -f telegram-bot-api feedbot
 
 `telegram-bot-api` 仅将 `8081` 端口绑定到宿主机的 `127.0.0.1`，feedbot 通过 Compose 内部服务名访问。数据保存在 `telegram-bot-api-data` volume。恢复官方 Telegram Bot API 时，清空 `TELEGRAM_API_URL`、设置 `LOCAL_MODE=false`，再执行普通的 `docker compose up -d`。
 
-本地 Bot API 处理大媒体时可能超过 teloxide 默认的短请求时限，项目默认将 Telegram 请求超时设为 600 秒，可用 `TELEGRAM_REQUEST_TIMEOUT_SECS` 调整。上游媒体单次下载超时默认也是 600 秒，可用 `MEDIA_DOWNLOAD_TIMEOUT_SECS` 调整；失败后默认重试 3 次并尝试 Range 续传，可用 `MEDIA_DOWNLOAD_RETRIES` 调整。
+本地 Bot API 处理大媒体时可能超过 teloxide 默认的短请求时限，项目默认将 Telegram 请求超时设为 600 秒，可用 `TELEGRAM_REQUEST_TIMEOUT_SECS` 调整。上游媒体单次下载超时默认是 120 秒，可用 `MEDIA_DOWNLOAD_TIMEOUT_SECS` 调整；失败后默认重试 3 次并尝试 Range 续传，可用 `MEDIA_DOWNLOAD_RETRIES` 调整。Bilibili 默认依次使用 API 的 `baseUrl` 和 `backupUrl`；可设置 `BILIBILI_CDN=ali`（也支持 `cos`、`hw`、`akamai` 等）优先尝试指定 UPOS 镜像，或设置为 `backupUrl` 优先使用 API 备用地址。
 
 ## Linux x64 Release 启动
 
@@ -113,7 +113,7 @@ sudo apt-get update
 sudo apt-get install -y ffmpeg python3 python3-pip curl
 sudo pip3 install --break-system-packages -U yt-dlp
 
-VERSION=v0.2.6
+VERSION=v0.2.8
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"

@@ -90,6 +90,7 @@ impl Provider for XProvider {
                         cache_key: format!("x:{id}:photo:{index}"),
                         requires_download: false,
                         secondary_url: None,
+                        secondary_fallback_urls: vec![],
                     });
                 }
             }
@@ -147,6 +148,7 @@ impl Provider for XProvider {
                         cache_key: format!("x:{id}:video:{index}:{quality}p"),
                         requires_download: true,
                         secondary_url: None,
+                        secondary_fallback_urls: vec![],
                     });
                 }
             }

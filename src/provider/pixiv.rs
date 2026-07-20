@@ -234,6 +234,7 @@ impl Provider for PixivProvider {
                 cache_key: format!("pixiv:{id}:ugoira"),
                 requires_download: true,
                 secondary_url: Some(format!("ugoira:{frames}")),
+                secondary_fallback_urls: vec![],
             });
         }
         for (index, url) in urls.into_iter().enumerate() {
@@ -257,6 +258,7 @@ impl Provider for PixivProvider {
                 cache_key: format!("pixiv:{id}:p{index}"),
                 requires_download: true,
                 secondary_url: None,
+                secondary_fallback_urls: vec![],
             });
         }
         if media.is_empty() {

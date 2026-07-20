@@ -178,6 +178,7 @@ impl Provider for NeteaseProvider {
                         cache_key: format!("netease:song:{id}:standard:v2"),
                         requires_download: true,
                         secondary_url: None,
+                        secondary_fallback_urls: vec![],
                     }],
                     collection_items: Vec::new(),
                 })
@@ -242,6 +243,7 @@ impl Provider for NeteaseProvider {
                         cache_key: format!("netease:mv:{id}:{quality}"),
                         requires_download: true,
                         secondary_url: None,
+                        secondary_fallback_urls: vec![],
                     }],
                     collection_items: Vec::new(),
                 })
@@ -344,6 +346,7 @@ impl NeteaseProvider {
                     cache_key: format!("netease:collection:{id}:cover"),
                     requires_download: false,
                     secondary_url: None,
+                    secondary_fallback_urls: vec![],
                 }]
             },
             collection_items: tracks,

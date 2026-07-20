@@ -4,9 +4,10 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use congmiao_feedbot::{
@@ -25,7 +26,7 @@ fn config(temp_dir: PathBuf) -> Config {
         telegram_token: "test".into(),
         telegram_api_url: None,
         telegram_request_timeout_secs: 600,
-        media_download_timeout_secs: 600,
+        media_download_timeout_secs: 120,
         media_download_retries: 3,
         database_url: "sqlite::memory:".into(),
         redis_url: None,
@@ -37,6 +38,7 @@ fn config(temp_dir: PathBuf) -> Config {
         youtube_cookies_file: None,
         pixiv_refresh_token: None,
         bilibili_cookie: None,
+        bilibili_cdn: congmiao_feedbot::BilibiliCdnPreference::BaseUrl,
         bilibili_passport_base: String::new(),
         bilibili_api_base: String::new(),
         bilibili_live_api_base: String::new(),
@@ -111,6 +113,7 @@ async fn interrupted_download_resumes_with_http_range() {
         cache_key: "test:resume".into(),
         requires_download: true,
         secondary_url: None,
+        secondary_fallback_urls: vec![],
     };
     let content = ParsedContent {
         platform: Platform::Bilibili,
@@ -137,6 +140,72 @@ async fn interrupted_download_resumes_with_http_range() {
         b"helloworld"
     );
     processor.cleanup(prepared).await;
+}
+
+#[tokio::test]
+async fn oversized_content_length_stops_without_retries() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_for_server = requests.clone();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    requests_for_server.fetch_add(1, Ordering::SeqCst);
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request);
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 52428801\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("测试服务器错误: {error}"),
+            }
+        }
+    });
+    let item = MediaItem {
+        kind: MediaKind::Document,
+        source_url: format!("http://{address}/too-large"),
+        fallback_urls: vec![],
+        thumbnail_url: None,
+        filename: "too-large.bin".into(),
+        mime_type: Some("application/octet-stream".into()),
+        duration_secs: None,
+        width: None,
+        height: None,
+        size: None,
+        headers: Default::default(),
+        cache_key: "test:too-large".into(),
+        requires_download: true,
+        secondary_url: None,
+        secondary_fallback_urls: vec![],
+    };
+    let content = ParsedContent {
+        platform: Platform::Bilibili,
+        kind: ContentKind::Post,
+        id: "too-large".into(),
+        canonical_url: "https://example.com/too-large".into(),
+        author: Author::default(),
+        title: String::new(),
+        text: String::new(),
+        sensitive: false,
+        stats: Default::default(),
+        media: vec![item.clone()],
+        collection_items: vec![],
+    };
+    let output_dir = tempfile::tempdir().unwrap();
+    let processor = MediaProcessor::new(Client::new(), &config(output_dir.path().into()));
+    let error = processor.prepare(&content, &item, 720).await.unwrap_err();
+    server.join().unwrap();
+    assert!(error.to_string().contains("50MB"));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -189,6 +258,7 @@ async fn oversized_photo_dimensions_force_document_mode() {
         cache_key: "test:tall-photo".into(),
         requires_download: true,
         secondary_url: None,
+        secondary_fallback_urls: vec![],
     };
     let content = ParsedContent {
         platform: Platform::X,
@@ -283,7 +353,8 @@ async fn downloads_and_merges_dash_tracks_with_ffmpeg() {
         headers: Default::default(),
         cache_key: "test:merge".into(),
         requires_download: true,
-        secondary_url: Some(format!("{}/a", server.uri())),
+        secondary_url: Some(format!("{}/missing-audio", server.uri())),
+        secondary_fallback_urls: vec![format!("{}/a", server.uri())],
     };
     let content = ParsedContent {
         platform: Platform::Bilibili,
@@ -299,7 +370,9 @@ async fn downloads_and_merges_dash_tracks_with_ffmpeg() {
         collection_items: vec![],
     };
     let output_dir = tempfile::tempdir().unwrap();
-    let processor = MediaProcessor::new(Client::new(), &config(output_dir.path().into()));
+    let mut test_config = config(output_dir.path().into());
+    test_config.media_download_retries = 0;
+    let processor = MediaProcessor::new(Client::new(), &test_config);
     let prepared = processor.prepare(&content, &item, 720).await.unwrap();
     assert!(tokio::fs::metadata(&prepared.path).await.unwrap().len() > 0);
     assert_eq!(prepared.item.width, Some(320));
@@ -395,6 +468,7 @@ async fn converts_pixiv_ugoira_zip_to_mp4() {
         cache_key: "test:ugoira".into(),
         requires_download: true,
         secondary_url: Some(format!("ugoira:{metadata}")),
+        secondary_fallback_urls: vec![],
     };
     let content = ParsedContent {
         platform: Platform::Pixiv,

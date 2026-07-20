@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use async_trait::async_trait;
 use regex::Regex;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::{Config, RuntimeCredentials, model::*};
+use crate::{BilibiliCdnPreference, Config, RuntimeCredentials, model::*};
 
 use super::{Provider, filename_from_url, get_str, get_u64, json_response};
 
@@ -16,6 +16,7 @@ pub struct BilibiliProvider {
     live_api_base: String,
     www_base: String,
     max_media_size: u64,
+    cdn: BilibiliCdnPreference,
     matcher: Regex,
     bvid: Regex,
 }
@@ -41,6 +42,7 @@ impl BilibiliProvider {
             } else {
                 50 * 1024 * 1024
             },
+            cdn: config.bilibili_cdn,
             matcher: Regex::new(
                 r"(?i)(?:bilibili\.com|b23\.tv|(?:^|\s)BV[0-9A-Za-z]{10}|(?:^|\s)av\d+)",
             )
@@ -100,6 +102,28 @@ impl BilibiliProvider {
             headers.insert("Cookie".into(), cookie);
         }
         headers
+    }
+
+    fn order_media_urls(&self, primary: String, backups: Vec<String>) -> (String, Vec<String>) {
+        let mut urls: Vec<String> = match self.cdn {
+            BilibiliCdnPreference::BaseUrl => {
+                std::iter::once(primary.clone()).chain(backups).collect()
+            }
+            BilibiliCdnPreference::BackupUrl => backups
+                .into_iter()
+                .chain(std::iter::once(primary.clone()))
+                .collect(),
+            BilibiliCdnPreference::Mirror(host) => rewrite_cdn_host(&primary, host)
+                .into_iter()
+                .chain(std::iter::once(primary.clone()))
+                .chain(backups)
+                .collect(),
+        };
+        let mut seen = HashSet::new();
+        urls.retain(|url| seen.insert(url.clone()));
+        let selected = urls.first().cloned().unwrap_or(primary);
+        let fallbacks = urls.into_iter().skip(1).collect();
+        (selected, fallbacks)
     }
 
     async fn parse_video(
@@ -190,6 +214,7 @@ impl BilibiliProvider {
         let mut primary = get_str(p, "/durl/0/url").map(str::to_string);
         let mut fallback_urls = string_array(p.pointer("/durl/0/backup_url"));
         let mut secondary = None;
+        let mut secondary_fallback_urls = Vec::new();
         let mut selected_width = None;
         let mut selected_height = None;
         let mut selected_size = get_u64(p, "/durl/0/size");
@@ -249,12 +274,27 @@ impl BilibiliProvider {
                 selected_height = get_u64(stream, "/height").map(|value| value as u32);
                 selected_size = get_u64(stream, "/size");
             }
-            secondary = p
+            if let Some(audio) = p
                 .pointer("/dash/audio")
                 .and_then(Value::as_array)
-                .and_then(|a| a.first())
-                .and_then(|v| get_str(v, "/baseUrl").or_else(|| get_str(v, "/base_url")))
-                .map(str::to_string);
+                .and_then(|audio| audio.first())
+            {
+                secondary = get_str(audio, "/baseUrl")
+                    .or_else(|| get_str(audio, "/base_url"))
+                    .map(str::to_string);
+                secondary_fallback_urls =
+                    string_array(audio.get("backupUrl").or_else(|| audio.get("backup_url")));
+            }
+        }
+        if let Some(url) = primary.take() {
+            let (selected, fallbacks) = self.order_media_urls(url, fallback_urls);
+            primary = Some(selected);
+            fallback_urls = fallbacks;
+        }
+        if let Some(url) = secondary.take() {
+            let (selected, fallbacks) = self.order_media_urls(url, secondary_fallback_urls);
+            secondary = Some(selected);
+            secondary_fallback_urls = fallbacks;
         }
         let selected_quality = selected_height.unwrap_or(options.quality.unwrap_or(720));
         let media_headers = self.headers().await;
@@ -277,6 +317,7 @@ impl BilibiliProvider {
                     headers: media_headers,
                     cache_key: format!("bilibili:{actual_bvid}:{qn}:{selected_quality}p"),
                     requires_download: true,
+                    secondary_fallback_urls,
                 }]
             })
             .unwrap_or_default();
@@ -364,6 +405,7 @@ impl BilibiliProvider {
                         cache_key: format!("bilibili:live:{id}:cover"),
                         requires_download: false,
                         secondary_url: None,
+                        secondary_fallback_urls: vec![],
                     }]
                 })
                 .unwrap_or_default(),
@@ -412,6 +454,7 @@ impl BilibiliProvider {
                         cache_key: format!("bilibili:opus:{id}:{i}"),
                         requires_download: false,
                         secondary_url: None,
+                        secondary_fallback_urls: vec![],
                     });
                 }
             }
@@ -467,8 +510,12 @@ impl BilibiliProvider {
                 &[("sid", &id), ("quality", "2"), ("privilege", "2")],
             )
             .await?;
-        let source = get_str(&stream, "/data/cdns/0")
-            .ok_or_else(|| ProviderError::Unavailable(url.into()))?;
+        let mut sources = string_array(stream.pointer("/data/cdns"));
+        if sources.is_empty() {
+            return Err(ProviderError::Unavailable(url.into()));
+        }
+        let source = sources.remove(0);
+        let (source, fallback_urls) = self.order_media_urls(source, sources);
         Ok(ParsedContent {
             platform: Platform::Bilibili,
             kind: ContentKind::Audio,
@@ -492,8 +539,8 @@ impl BilibiliProvider {
             },
             media: vec![MediaItem {
                 kind: MediaKind::Audio,
-                source_url: source.into(),
-                fallback_urls: vec![],
+                source_url: source,
+                fallback_urls,
                 thumbnail_url: get_str(song, "/cover").map(str::to_string),
                 filename: format!("bilibili-au{id}.m4a"),
                 mime_type: Some("audio/mp4".into()),
@@ -505,6 +552,7 @@ impl BilibiliProvider {
                 cache_key: format!("bilibili:audio:{id}"),
                 requires_download: true,
                 secondary_url: None,
+                secondary_fallback_urls: vec![],
             }],
             collection_items: Vec::new(),
         })
@@ -563,12 +611,20 @@ impl BilibiliProvider {
                         cache_key: format!("bilibili:article:{id}:cover"),
                         requires_download: false,
                         secondary_url: None,
+                        secondary_fallback_urls: vec![],
                     }]
                 })
                 .unwrap_or_default(),
             collection_items: Vec::new(),
         })
     }
+}
+
+fn rewrite_cdn_host(value: &str, host: &str) -> Option<String> {
+    let mut url = url::Url::parse(value).ok()?;
+    url.set_host(Some(host)).ok()?;
+    url.set_port(None).ok()?;
+    Some(url.into())
 }
 
 fn estimated_stream_size(
