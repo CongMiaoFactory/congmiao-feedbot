@@ -147,20 +147,12 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
             options: options.clone(),
         })
         .collect();
-    let mut progress = ProgressHint::start(
-        bot.clone(),
-        msg.chat.id,
-        msg.id,
-        ChatAction::Typing,
-        "⏳ 正在解析…",
-    )
-    .await;
+    // 仅使用 Telegram 原生会话状态（正在输入/正在发送视频等），不发送额外提示消息。
+    let status = ChatStatus::start(bot.clone(), msg.chat.id, ChatAction::Typing).await;
     for result in parse_cached(&state, requests).await {
         match result {
             Ok(content) => {
-                progress
-                    .update(chat_action_for_content(&content), "⏳ 正在发送…")
-                    .await;
+                status.set(chat_action_for_content(&content)).await;
                 if let Err(err) = send_content(&bot, &msg, &state, content, &options).await {
                     error!(?err, "发送内容失败");
                     bot.send_message(msg.chat.id, format!("媒体发送失败：{err}"))
@@ -175,72 +167,51 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
             }
         }
     }
-    progress.finish().await;
+    status.finish();
     Ok(())
 }
 
-struct ProgressHint {
+/// 通过 `sendChatAction` 维持客户端侧状态提示（约每 5 秒需刷新一次）。
+struct ChatStatus {
     bot: Bot,
     chat_id: ChatId,
-    message_id: Option<MessageId>,
     action_task: JoinHandle<()>,
     action: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
-impl ProgressHint {
-    async fn start(
-        bot: Bot,
-        chat_id: ChatId,
-        reply_to: MessageId,
-        action: ChatAction,
-        text: &str,
-    ) -> Self {
-        let message_id = bot
-            .send_message(chat_id, text)
-            .reply_parameters(ReplyParameters::new(reply_to))
-            .await
-            .ok()
-            .map(|message| message.id);
+impl ChatStatus {
+    async fn start(bot: Bot, chat_id: ChatId, action: ChatAction) -> Self {
         let action_code =
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(action_code(action)));
+        let _ = bot.send_chat_action(chat_id, action).await;
         let action_task = {
             let bot = bot.clone();
             let action_code = action_code.clone();
             tokio::spawn(async move {
                 loop {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
                     let action =
                         action_from_code(action_code.load(std::sync::atomic::Ordering::Relaxed));
                     let _ = bot.send_chat_action(chat_id, action).await;
-                    tokio::time::sleep(Duration::from_secs(4)).await;
                 }
             })
         };
         Self {
             bot,
             chat_id,
-            message_id,
             action_task,
             action: action_code,
         }
     }
 
-    async fn update(&mut self, action: ChatAction, text: &str) {
+    async fn set(&self, action: ChatAction) {
         self.action
             .store(action_code(action), std::sync::atomic::Ordering::Relaxed);
         let _ = self.bot.send_chat_action(self.chat_id, action).await;
-        if let Some(message_id) = self.message_id {
-            let _ = self
-                .bot
-                .edit_message_text(self.chat_id, message_id, text)
-                .await;
-        }
     }
 
-    async fn finish(self) {
+    fn finish(self) {
         self.action_task.abort();
-        if let Some(message_id) = self.message_id {
-            let _ = self.bot.delete_message(self.chat_id, message_id).await;
-        }
     }
 }
 
