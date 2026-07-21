@@ -74,6 +74,10 @@ impl ProviderRegistry {
         self.providers.iter().find(|p| p.can_handle(url)).cloned()
     }
 
+    pub fn supports(&self, url: &str) -> bool {
+        self.find(url).is_some()
+    }
+
     pub async fn parse_one(&self, request: ParseRequest) -> ProviderResult<ParsedContent> {
         self.find(&request.url)
             .ok_or_else(|| ProviderError::Unsupported(request.url.clone()))?

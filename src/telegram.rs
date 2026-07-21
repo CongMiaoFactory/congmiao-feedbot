@@ -116,6 +116,8 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
     {
         urls = extract_message_urls(replied);
     }
+    // 先按平台匹配，只保留本 Bot 能处理的链接；未匹配到则直接返回，不发状态、不解析。
+    let urls = filter_supported_urls(&state.registry, urls);
     if urls.is_empty() {
         if msg.chat.is_private() && text.starts_with('/') {
             bot.send_message(msg.chat.id, "未找到支持的链接").await?;
@@ -147,7 +149,7 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
             options: options.clone(),
         })
         .collect();
-    // 仅使用 Telegram 原生会话状态（正在输入/正在发送视频等），不发送额外提示消息。
+    // 匹配到支持链接后再显示 Telegram 原生会话状态。
     let status = ChatStatus::start(bot.clone(), msg.chat.id, ChatAction::Typing).await;
     for result in parse_cached(&state, requests).await {
         match result {
@@ -954,7 +956,7 @@ async fn cache_message(state: &BotState, item: &MediaItem, msg: &Message) {
 }
 
 async fn handle_inline(bot: Bot, query: InlineQuery, state: BotState) -> ResponseResult<()> {
-    let urls = extract_urls(&query.query);
+    let urls = filter_supported_urls(&state.registry, extract_urls(&query.query));
     let Some(url) = urls.first() else {
         bot.answer_inline_query(query.id, Vec::<InlineQueryResult>::new())
             .cache_time(1)
@@ -1086,6 +1088,16 @@ fn article_result(content: &ParsedContent, title: String) -> InlineQueryResult {
             InputMessageContentText::new(caption(content, 4096)).parse_mode(ParseMode::Html),
         ),
     ))
+}
+
+fn filter_supported_urls(registry: &ProviderRegistry, urls: Vec<String>) -> Vec<String> {
+    let mut supported = Vec::new();
+    for url in urls {
+        if registry.supports(&url) && !supported.iter().any(|existing| existing == &url) {
+            supported.push(url);
+        }
+    }
+    supported
 }
 
 pub fn extract_urls(text: &str) -> Vec<String> {
