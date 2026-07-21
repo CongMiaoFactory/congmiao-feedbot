@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&config.temp_dir).await?;
     let storage = Storage::connect(&config.database_url).await?;
     let credentials = RuntimeCredentials::load(storage.clone(), &config).await?;
-    let cache = AppCache::new(config.redis_url.as_deref()).await;
+    let cache = AppCache::new();
     let registry = ProviderRegistry::new_with_credentials(&config, credentials.clone())?;
     let login = LoginService::new(&config, credentials.clone())?;
     let client = Client::builder()

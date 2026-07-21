@@ -23,7 +23,6 @@ fn config() -> Config {
         media_download_timeout_secs: 120,
         media_download_retries: 3,
         database_url: "sqlite::memory:".into(),
-        redis_url: None,
         fxtwitter_api_base: "https://api.fxtwitter.com".into(),
         pixiv_web_api_base: "https://www.pixiv.net".into(),
         netease_api_base: "http://127.0.0.1:3000".into(),
@@ -404,7 +403,7 @@ async fn sqlite_cache_and_local_rate_limit_work() {
             .as_deref(),
         Some("file")
     );
-    let cache = AppCache::new(None).await;
+    let cache = AppCache::new();
     assert!(cache.allow("u", 2, Duration::from_secs(60)).await);
     assert!(cache.allow("u", 2, Duration::from_secs(60)).await);
     assert!(!cache.allow("u", 2, Duration::from_secs(60)).await);

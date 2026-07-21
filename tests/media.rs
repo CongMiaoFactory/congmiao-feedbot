@@ -29,7 +29,6 @@ fn config(temp_dir: PathBuf) -> Config {
         media_download_timeout_secs: 120,
         media_download_retries: 3,
         database_url: "sqlite::memory:".into(),
-        redis_url: None,
         fxtwitter_api_base: String::new(),
         pixiv_web_api_base: String::new(),
         netease_api_base: String::new(),

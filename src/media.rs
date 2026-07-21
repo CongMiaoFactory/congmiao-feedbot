@@ -48,6 +48,14 @@ impl fmt::Display for MediaTooLarge {
 
 impl std::error::Error for MediaTooLarge {}
 
+/// 判断错误是否属于无需刷新上游地址的永久失败，例如媒体超过 Telegram 上传限制。
+pub fn is_permanent_prepare_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<MediaTooLarge>().is_some()
+        || error
+            .chain()
+            .any(|source| source.downcast_ref::<MediaTooLarge>().is_some())
+}
+
 #[derive(Debug)]
 pub struct PreparedMedia {
     pub item: MediaItem,
@@ -434,6 +442,8 @@ impl MediaProcessor {
             let chunk = chunk?;
             total = total.saturating_add(chunk.len() as u64);
             if total > download_limit {
+                drop(file);
+                let _ = tokio::fs::remove_file(target).await;
                 return Err(MediaTooLarge {
                     max_size: download_limit,
                 }

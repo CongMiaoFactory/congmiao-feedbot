@@ -75,7 +75,6 @@ pub struct Config {
     pub media_download_timeout_secs: u64,
     pub media_download_retries: usize,
     pub database_url: String,
-    pub redis_url: Option<String>,
     pub fxtwitter_api_base: String,
     pub pixiv_web_api_base: String,
     pub netease_api_base: String,
@@ -118,7 +117,6 @@ impl Config {
             media_download_retries: parse("MEDIA_DOWNLOAD_RETRIES", 3),
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://data/feedbot.db?mode=rwc".to_string()),
-            redis_url: value("REDIS_URL"),
             fxtwitter_api_base: env::var("FXTWITTER_API_BASE")
                 .unwrap_or_else(|_| "https://api.fxtwitter.com".to_string()),
             pixiv_web_api_base: env::var("PIXIV_WEB_API_BASE")

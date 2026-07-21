@@ -23,7 +23,7 @@ use crate::{
     Config, MediaSpoilerMode, ProviderRegistry, RuntimeCredentials,
     cache::AppCache,
     login::{LoginPoll, LoginService},
-    media::{MediaProcessor, telegram_photo_dimensions_valid},
+    media::{MediaProcessor, is_permanent_prepare_error, telegram_photo_dimensions_valid},
     model::*,
     storage::Storage,
 };
@@ -309,8 +309,11 @@ async fn parse_cached(
         if let Ok(content) = &result
             && let Ok(value) = serde_json::to_string(content)
         {
+            // 需要下载的媒体常带签名 URL，缓存不宜过久。
             let ttl = if content.kind == ContentKind::Live {
                 Duration::from_secs(300)
+            } else if content.media.iter().any(|item| item.requires_download) {
+                Duration::from_secs(600)
             } else {
                 Duration::from_secs(3600)
             };
@@ -433,15 +436,13 @@ async fn send_content(
         return Ok(());
     }
     for (index, item) in selected.into_iter().enumerate() {
-        let cached_kind = kind_name(item.kind);
-        if let Some(file_id) = state
-            .storage
-            .get_file_id(&telegram_cache_key(item), cached_kind)
-            .await?
+        if let Some((cached_kind, file_id)) =
+            lookup_cached_file(state, item, options.file_mode).await?
         {
             send_cached(
                 bot,
                 item,
+                cached_kind,
                 file_id,
                 SendOptions {
                     chat: msg.chat.id,
@@ -533,6 +534,7 @@ async fn prepare_media_with_refresh(
     let quality = options.quality.unwrap_or(720);
     match state.media.prepare(content, item, quality).await {
         Ok(prepared) => Ok(prepared),
+        Err(initial_error) if is_permanent_prepare_error(&initial_error) => Err(initial_error),
         Err(initial_error) => {
             warn!(
                 error = %initial_error,
@@ -549,6 +551,24 @@ async fn prepare_media_with_refresh(
                 .map_err(|error| {
                     anyhow!("重新解析媒体地址失败: {error}; 初始错误: {initial_error}")
                 })?;
+            // 刷新后的签名地址写回本地解析缓存（按 canonical URL 键），缩短后续失败窗口。
+            if let Ok(value) = serde_json::to_string(&refreshed) {
+                let raw_key = format!(
+                    "{}:{:?}:{}:{}:{}",
+                    content.canonical_url,
+                    options.quality,
+                    options.file_mode,
+                    options.cover_only,
+                    state.credentials.revision()
+                );
+                let key = format!("parsed:{}", hex::encode(Sha256::digest(raw_key.as_bytes())));
+                let ttl = if refreshed.kind == ContentKind::Live {
+                    Duration::from_secs(300)
+                } else {
+                    Duration::from_secs(600)
+                };
+                state.cache.set(&key, value, ttl).await;
+            }
             let refreshed_item = refreshed
                 .media
                 .iter()
@@ -577,11 +597,7 @@ async fn input_for_item(
     options: &ParseOptions,
     prepared: &mut Vec<crate::media::PreparedMedia>,
 ) -> Result<InputFile> {
-    if let Some(id) = state
-        .storage
-        .get_file_id(&telegram_cache_key(item), kind_name(item.kind))
-        .await?
-    {
+    if let Some((_, id)) = lookup_cached_file(state, item, options.file_mode).await? {
         return Ok(InputFile::file_id(teloxide::types::FileId(id)));
     }
     if !item.requires_download && item.headers.is_empty() {
@@ -701,7 +717,8 @@ async fn send_local(
 
 async fn send_cached(
     bot: &Bot,
-    item: &MediaItem,
+    _item: &MediaItem,
+    cached_kind: MediaKind,
     id: String,
     options: SendOptions<'_>,
 ) -> Result<Message> {
@@ -715,7 +732,7 @@ async fn send_cached(
         thumbnail: _,
     } = options;
     let input = InputFile::file_id(teloxide::types::FileId(id));
-    Ok(match item.kind {
+    Ok(match cached_kind {
         MediaKind::Photo => {
             bot.send_photo(chat, input)
                 .reply_parameters(ReplyParameters::new(reply_to))
@@ -750,6 +767,7 @@ async fn send_cached(
                 .await?
         }
         MediaKind::Document => {
+            // document file_id 不能当作 photo 发送；超尺寸图片只能继续以文件复用。
             bot.send_document(chat, input)
                 .reply_parameters(ReplyParameters::new(reply_to))
                 .caption(caption)
@@ -759,23 +777,59 @@ async fn send_cached(
     })
 }
 
-async fn cache_message(state: &BotState, item: &MediaItem, msg: &Message) {
-    let file = match item.kind {
-        MediaKind::Photo => msg
-            .photo()
-            .and_then(|p| p.last())
-            .map(|p| (&p.file.id, &p.file.unique_id)),
-        MediaKind::Video => msg.video().map(|x| (&x.file.id, &x.file.unique_id)),
-        MediaKind::Audio => msg.audio().map(|x| (&x.file.id, &x.file.unique_id)),
-        MediaKind::Animation => msg.animation().map(|x| (&x.file.id, &x.file.unique_id)),
-        MediaKind::Document => msg.document().map(|x| (&x.file.id, &x.file.unique_id)),
+async fn lookup_cached_file(
+    state: &BotState,
+    item: &MediaItem,
+    file_mode: bool,
+) -> Result<Option<(MediaKind, String)>> {
+    let key = telegram_cache_key(item);
+    let primary = if file_mode && item.kind != MediaKind::Document {
+        MediaKind::Document
+    } else {
+        item.kind
     };
-    if let Some((id, unique)) = file {
+    if let Some(file_id) = state.storage.get_file_id(&key, kind_name(primary)).await? {
+        return Ok(Some((primary, file_id)));
+    }
+    // 超尺寸图片首次会以 document 入库，后续普通发送也要能命中。
+    if item.kind == MediaKind::Photo
+        && primary != MediaKind::Document
+        && let Some(file_id) = state.storage.get_file_id(&key, "document").await?
+    {
+        return Ok(Some((MediaKind::Document, file_id)));
+    }
+    if primary == MediaKind::Document
+        && item.kind != MediaKind::Document
+        && let Some(file_id) = state
+            .storage
+            .get_file_id(&key, kind_name(item.kind))
+            .await?
+    {
+        return Ok(Some((item.kind, file_id)));
+    }
+    Ok(None)
+}
+
+async fn cache_message(state: &BotState, item: &MediaItem, msg: &Message) {
+    // 按 Telegram 实际返回的消息类型缓存，避免“图片被强制按文件发送”后写错 kind。
+    let file = if let Some(photo) = msg.photo().and_then(|photos| photos.last()) {
+        Some(("photo", &photo.file.id, &photo.file.unique_id))
+    } else if let Some(video) = msg.video() {
+        Some(("video", &video.file.id, &video.file.unique_id))
+    } else if let Some(audio) = msg.audio() {
+        Some(("audio", &audio.file.id, &audio.file.unique_id))
+    } else if let Some(animation) = msg.animation() {
+        Some(("animation", &animation.file.id, &animation.file.unique_id))
+    } else {
+        msg.document()
+            .map(|document| ("document", &document.file.id, &document.file.unique_id))
+    };
+    if let Some((kind, id, unique)) = file {
         let _ = state
             .storage
             .put_file_id(
                 &telegram_cache_key(item),
-                kind_name(item.kind),
+                kind,
                 id.0.as_str(),
                 Some(unique.0.as_str()),
             )
@@ -826,13 +880,9 @@ async fn inline_result(state: &BotState, content: &ParsedContent) -> InlineQuery
         return article_result(content, title);
     }
     if let Some(item) = content.media.first() {
-        if let Ok(Some(file_id)) = state
-            .storage
-            .get_file_id(&telegram_cache_key(item), kind_name(item.kind))
-            .await
-        {
+        if let Ok(Some((cached_kind, file_id))) = lookup_cached_file(state, item, false).await {
             let id = FileId(file_id);
-            return match item.kind {
+            return match cached_kind {
                 MediaKind::Photo => InlineQueryResult::CachedPhoto(
                     InlineQueryResultCachedPhoto::new(content.id.clone(), id)
                         .title(title)
