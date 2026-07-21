@@ -9,14 +9,14 @@ use teloxide::{
     error_handlers::LoggingErrorHandler,
     prelude::*,
     types::{
-        FileId, InlineQueryResult, InlineQueryResultArticle, InlineQueryResultCachedAudio,
-        InlineQueryResultCachedPhoto, InlineQueryResultCachedVideo, InlineQueryResultPhoto,
-        InlineQueryResultVideo, InputFile, InputMedia, InputMediaPhoto, InputMediaVideo,
-        InputMessageContent, InputMessageContentText, MessageEntityKind, MessageId, ParseMode,
-        ReplyParameters,
+        ChatAction, FileId, InlineQueryResult, InlineQueryResultArticle,
+        InlineQueryResultCachedAudio, InlineQueryResultCachedPhoto, InlineQueryResultCachedVideo,
+        InlineQueryResultPhoto, InlineQueryResultVideo, InputFile, InputMedia, InputMediaPhoto,
+        InputMediaVideo, InputMessageContent, InputMessageContentText, MessageEntityKind,
+        MessageId, ParseMode, ReplyParameters,
     },
 };
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::JoinHandle};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -90,7 +90,11 @@ pub async fn run(state: BotState) -> Result<()> {
 async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResult<()> {
     let text = msg.text().or_else(|| msg.caption()).unwrap_or_default();
     if text == "/start" || text == "/help" {
-        bot.send_message(msg.chat.id, "发送 X、YouTube、Pixiv、哔哩哔哩或网易云链接即可解析；在链接后加 +sp 可手动开启媒体遮罩。\n命令：/parse、/video [清晰度]、/file、/cover、/login [bili|netease]") .await?;
+        bot.send_message(
+            msg.chat.id,
+            "发送 X、YouTube、Pixiv、哔哩哔哩或网易云链接即可解析；在链接后加 +sp 可手动开启媒体遮罩。\n命令：/parse、/video [清晰度，默认 480p]、/file、/cover、/login [bili|netease]",
+        )
+        .await?;
         return Ok(());
     }
     if text.starts_with("/login") {
@@ -143,9 +147,20 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
             options: options.clone(),
         })
         .collect();
+    let mut progress = ProgressHint::start(
+        bot.clone(),
+        msg.chat.id,
+        msg.id,
+        ChatAction::Typing,
+        "⏳ 正在解析…",
+    )
+    .await;
     for result in parse_cached(&state, requests).await {
         match result {
             Ok(content) => {
+                progress
+                    .update(chat_action_for_content(&content), "⏳ 正在发送…")
+                    .await;
                 if let Err(err) = send_content(&bot, &msg, &state, content, &options).await {
                     error!(?err, "发送内容失败");
                     bot.send_message(msg.chat.id, format!("媒体发送失败：{err}"))
@@ -160,7 +175,104 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
             }
         }
     }
+    progress.finish().await;
     Ok(())
+}
+
+struct ProgressHint {
+    bot: Bot,
+    chat_id: ChatId,
+    message_id: Option<MessageId>,
+    action_task: JoinHandle<()>,
+    action: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl ProgressHint {
+    async fn start(
+        bot: Bot,
+        chat_id: ChatId,
+        reply_to: MessageId,
+        action: ChatAction,
+        text: &str,
+    ) -> Self {
+        let message_id = bot
+            .send_message(chat_id, text)
+            .reply_parameters(ReplyParameters::new(reply_to))
+            .await
+            .ok()
+            .map(|message| message.id);
+        let action_code =
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(action_code(action)));
+        let action_task = {
+            let bot = bot.clone();
+            let action_code = action_code.clone();
+            tokio::spawn(async move {
+                loop {
+                    let action =
+                        action_from_code(action_code.load(std::sync::atomic::Ordering::Relaxed));
+                    let _ = bot.send_chat_action(chat_id, action).await;
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                }
+            })
+        };
+        Self {
+            bot,
+            chat_id,
+            message_id,
+            action_task,
+            action: action_code,
+        }
+    }
+
+    async fn update(&mut self, action: ChatAction, text: &str) {
+        self.action
+            .store(action_code(action), std::sync::atomic::Ordering::Relaxed);
+        let _ = self.bot.send_chat_action(self.chat_id, action).await;
+        if let Some(message_id) = self.message_id {
+            let _ = self
+                .bot
+                .edit_message_text(self.chat_id, message_id, text)
+                .await;
+        }
+    }
+
+    async fn finish(self) {
+        self.action_task.abort();
+        if let Some(message_id) = self.message_id {
+            let _ = self.bot.delete_message(self.chat_id, message_id).await;
+        }
+    }
+}
+
+fn action_code(action: ChatAction) -> u8 {
+    match action {
+        ChatAction::Typing => 0,
+        ChatAction::UploadPhoto => 1,
+        ChatAction::UploadVideo => 2,
+        ChatAction::UploadDocument => 3,
+        ChatAction::UploadVoice => 4,
+        _ => 0,
+    }
+}
+
+fn action_from_code(code: u8) -> ChatAction {
+    match code {
+        1 => ChatAction::UploadPhoto,
+        2 => ChatAction::UploadVideo,
+        3 => ChatAction::UploadDocument,
+        4 => ChatAction::UploadVoice,
+        _ => ChatAction::Typing,
+    }
+}
+
+fn chat_action_for_content(content: &ParsedContent) -> ChatAction {
+    match content.media.first().map(|item| item.kind) {
+        Some(MediaKind::Video | MediaKind::Animation) => ChatAction::UploadVideo,
+        Some(MediaKind::Photo) => ChatAction::UploadPhoto,
+        Some(MediaKind::Audio) => ChatAction::UploadVoice,
+        Some(MediaKind::Document) => ChatAction::UploadDocument,
+        None => ChatAction::Typing,
+    }
 }
 
 async fn handle_login(bot: Bot, msg: &Message, state: &BotState, text: &str) -> ResponseResult<()> {
@@ -383,24 +495,25 @@ async fn send_content(
             let mut group = Vec::new();
             let mut prepared = Vec::new();
             for (i, item) in chunk.iter().enumerate() {
-                let input = input_for_item(state, &content, item, options, &mut prepared).await?;
+                let (input, resolved) =
+                    input_for_item(state, &content, item, options, &mut prepared).await?;
                 let c = if i == 0 {
                     Some(caption_text.clone())
                 } else {
                     None
                 };
-                group.push(match item.kind {
+                group.push(match resolved.kind {
                     MediaKind::Video => {
                         let mut media = InputMediaVideo::new(input)
                             .caption(c.unwrap_or_default())
                             .parse_mode(ParseMode::Html)
                             .supports_streaming(true);
-                        media.width = item.width.and_then(|value| u16::try_from(value).ok());
-                        media.height = item.height.and_then(|value| u16::try_from(value).ok());
-                        media.duration = item
+                        media.width = resolved.width.and_then(|value| u16::try_from(value).ok());
+                        media.height = resolved.height.and_then(|value| u16::try_from(value).ok());
+                        media.duration = resolved
                             .duration_secs
                             .and_then(|value| u16::try_from(value).ok());
-                        media.cover = item
+                        media.cover = resolved
                             .thumbnail_url
                             .as_ref()
                             .and_then(|url| url.parse().ok())
@@ -458,20 +571,48 @@ async fn send_content(
             continue;
         }
         let prepared = prepare_media_with_refresh(state, &content, item, options).await;
-        let prepared_thumbnail = if matches!(item.kind, MediaKind::Audio | MediaKind::Video) {
-            if let Some(url) = &item.thumbnail_url {
-                match state.media.prepare_thumbnail(url, &item.cache_key).await {
+        let prepared_thumbnail = match (prepared.as_ref(), item.kind) {
+            (Ok(prepared_media), MediaKind::Video) => {
+                match state
+                    .media
+                    .prepare_video_thumbnail(&prepared_media.path, &item.cache_key)
+                    .await
+                {
                     Ok(path) => Some(path),
-                    Err(err) => {
-                        warn!(?err, "媒体封面准备失败，继续发送无封面媒体");
-                        None
+                    Err(local_err) => {
+                        if let Some(url) = &item.thumbnail_url {
+                            match state.media.prepare_thumbnail(url, &item.cache_key).await {
+                                Ok(path) => Some(path),
+                                Err(err) => {
+                                    warn!(
+                                        local = %local_err,
+                                        remote = %err,
+                                        "视频封面准备失败，继续发送无封面视频"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            warn!(error = %local_err, "视频封面准备失败，继续发送无封面视频");
+                            None
+                        }
                     }
                 }
-            } else {
-                None
             }
-        } else {
-            None
+            (_, MediaKind::Audio) => {
+                if let Some(url) = &item.thumbnail_url {
+                    match state.media.prepare_thumbnail(url, &item.cache_key).await {
+                        Ok(path) => Some(path),
+                        Err(err) => {
+                            warn!(?err, "媒体封面准备失败，继续发送无封面媒体");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
         let sent = match prepared.as_ref() {
             Ok(p) => {
@@ -531,7 +672,7 @@ async fn prepare_media_with_refresh(
     item: &MediaItem,
     options: &ParseOptions,
 ) -> Result<crate::media::PreparedMedia> {
-    let quality = options.quality.unwrap_or(720);
+    let quality = options.quality_or_default();
     match state.media.prepare(content, item, quality).await {
         Ok(prepared) => Ok(prepared),
         Err(initial_error) if is_permanent_prepare_error(&initial_error) => Err(initial_error),
@@ -596,17 +737,21 @@ async fn input_for_item(
     item: &MediaItem,
     options: &ParseOptions,
     prepared: &mut Vec<crate::media::PreparedMedia>,
-) -> Result<InputFile> {
+) -> Result<(InputFile, MediaItem)> {
     if let Some((_, id)) = lookup_cached_file(state, item, options.file_mode).await? {
-        return Ok(InputFile::file_id(teloxide::types::FileId(id)));
+        return Ok((
+            InputFile::file_id(teloxide::types::FileId(id)),
+            item.clone(),
+        ));
     }
     if !item.requires_download && item.headers.is_empty() {
-        return Ok(InputFile::url(item.source_url.parse()?));
+        return Ok((InputFile::url(item.source_url.parse()?), item.clone()));
     }
     let p = prepare_media_with_refresh(state, content, item, options).await?;
+    let resolved = p.item.clone();
     let input = InputFile::file(p.path.clone());
     prepared.push(p);
-    Ok(input)
+    Ok((input, resolved))
 }
 
 #[derive(Clone, Copy)]

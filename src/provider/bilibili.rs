@@ -192,7 +192,7 @@ impl BilibiliProvider {
         let actual_bvid = get_str(data, "/bvid")
             .unwrap_or_else(|| bvid.as_deref().unwrap_or(""))
             .to_string();
-        let qn = match options.quality.unwrap_or(720) {
+        let qn = match options.quality_or_default() {
             1080.. => "80",
             720..=1079 => "64",
             480..=719 => "32",
@@ -219,7 +219,7 @@ impl BilibiliProvider {
         let mut selected_height = None;
         let mut selected_size = get_u64(p, "/durl/0/size");
         if primary.is_none() {
-            let target = options.quality.unwrap_or(720) as u64;
+            let target = options.quality_or_default() as u64;
             let duration = get_u64(p, "/dash/duration").or_else(|| get_u64(data, "/duration"));
             let audio_bandwidth = get_u64(p, "/dash/audio/0/bandwidth").unwrap_or_default();
             let selected_video =
@@ -296,7 +296,7 @@ impl BilibiliProvider {
             secondary = Some(selected);
             secondary_fallback_urls = fallbacks;
         }
-        let selected_quality = selected_height.unwrap_or(options.quality.unwrap_or(720));
+        let selected_quality = selected_height.unwrap_or(options.quality_or_default());
         let media_headers = self.headers().await;
         let media = primary
             .map(|source_url| {

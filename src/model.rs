@@ -106,12 +106,21 @@ pub struct ParsedContent {
     pub collection_items: Vec<String>,
 }
 
+/// 未指定 `/video` 清晰度时的默认上限：最高不超过 480p。
+pub const DEFAULT_VIDEO_QUALITY: u32 = 480;
+
 #[derive(Debug, Clone, Default)]
 pub struct ParseOptions {
     pub quality: Option<u32>,
     pub file_mode: bool,
     pub cover_only: bool,
     pub force_spoiler: bool,
+}
+
+impl ParseOptions {
+    pub fn quality_or_default(&self) -> u32 {
+        self.quality.unwrap_or(DEFAULT_VIDEO_QUALITY)
+    }
 }
 
 #[derive(Debug, Clone)]

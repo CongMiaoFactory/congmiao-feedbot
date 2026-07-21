@@ -118,7 +118,7 @@ impl Provider for YouTubeProvider {
             height: get_u64(y, "/height").map(|n| n as u32),
             size: get_u64(y, "/filesize_approx"),
             headers: Default::default(),
-            cache_key: format!("youtube:{id}:{}p", request.options.quality.unwrap_or(720)),
+            cache_key: format!("youtube:{id}:{}p", request.options.quality_or_default()),
             requires_download: true,
             secondary_url: None,
             secondary_fallback_urls: vec![],

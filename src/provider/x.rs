@@ -96,7 +96,7 @@ impl Provider for XProvider {
             }
         }
         if let Some(items) = status.pointer("/media/videos").and_then(Value::as_array) {
-            let quality = request.options.quality.unwrap_or(720);
+            let quality = request.options.quality_or_default();
             for (index, item) in items.iter().enumerate() {
                 let selected = select_video_format(item, quality);
                 let url = selected

@@ -168,11 +168,48 @@ impl MediaProcessor {
                 String::from_utf8_lossy(&result.stderr)
             );
         }
-        if tokio::fs::metadata(&output).await?.len() > 200 * 1024 {
-            let _ = tokio::fs::remove_file(&output).await;
-            bail!("音频封面超过 Telegram 200KB 限制");
-        }
+        ensure_thumbnail_size(&output).await?;
         Ok(output)
+    }
+
+    /// 从本地视频抽一帧作为 Telegram 缩略图，避免再下载远程封面。
+    pub async fn prepare_video_thumbnail(
+        &self,
+        video_path: &Path,
+        cache_key: &str,
+    ) -> Result<PathBuf> {
+        let _permit = self.semaphore.acquire().await?;
+        tokio::fs::create_dir_all(&self.temp_dir).await?;
+        let safe = unique_temp_key(cache_key);
+        let output = self.temp_dir.join(format!("{safe}-vcover.jpg"));
+        // 优先取 1 秒处画面；极短视频再回退到开头。
+        for seek in ["00:00:01.000", "00:00:00.000"] {
+            let result = Command::new(&self.ffmpeg)
+                .args(["-y", "-ss", seek, "-i"])
+                .arg(video_path)
+                .args([
+                    "-vf",
+                    "scale=320:320:force_original_aspect_ratio=decrease",
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "5",
+                ])
+                .arg(&output)
+                .output()
+                .await?;
+            if result.status.success()
+                && tokio::fs::metadata(&output)
+                    .await
+                    .map(|meta| meta.len() > 0)
+                    .unwrap_or(false)
+            {
+                ensure_thumbnail_size(&output).await?;
+                return Ok(output);
+            }
+        }
+        let _ = tokio::fs::remove_file(&output).await;
+        bail!("无法从本地视频提取缩略图")
     }
 
     pub async fn cleanup_path(&self, path: impl AsRef<Path>) {
@@ -550,8 +587,9 @@ impl MediaProcessor {
     }
 
     async fn download_youtube(&self, url: &str, target: &Path, quality: u32) -> Result<()> {
+        // 优先整段 progressive MP4，避免音视频分离后再合并，加快发送链路。
         let format = format!(
-            "bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<={quality}][ext=mp4]/best[height<={quality}]"
+            "best[height<={quality}][ext=mp4][vcodec^=avc1][acodec^=mp4a]/bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<={quality}][ext=mp4]/best[height<={quality}]"
         );
         let mut cmd = Command::new(&self.yt_dlp);
         cmd.args([
@@ -616,8 +654,9 @@ impl MediaProcessor {
                 "0:v:0",
                 "-map",
                 "0:a:0?",
+                // 超限压缩目标贴近默认发送清晰度，减少转码耗时与体积。
                 "-vf",
-                "scale='min(1280,iw)':-2",
+                "scale='min(854,iw)':-2",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -641,6 +680,8 @@ impl MediaProcessor {
         if !out.status.success() {
             bail!("FFmpeg 压缩失败: {}", String::from_utf8_lossy(&out.stderr));
         }
+        // Windows 上 rename 覆盖已存在目标会失败，先删原文件。
+        let _ = tokio::fs::remove_file(path).await;
         tokio::fs::rename(compressed, path).await?;
         Ok(())
     }
@@ -733,6 +774,14 @@ impl MediaProcessor {
     pub async fn cleanup(&self, prepared: PreparedMedia) {
         let _ = tokio::fs::remove_file(prepared.path).await;
     }
+}
+
+async fn ensure_thumbnail_size(path: &Path) -> Result<()> {
+    if tokio::fs::metadata(path).await?.len() > 200 * 1024 {
+        let _ = tokio::fs::remove_file(path).await;
+        bail!("媒体封面超过 Telegram 200KB 限制");
+    }
+    Ok(())
 }
 
 fn parse_duration(value: &str) -> Option<u64> {

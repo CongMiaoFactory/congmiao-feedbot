@@ -173,25 +173,26 @@ async fn x_provider_selects_h264_source_at_or_below_requested_quality() {
         })
         .await
         .unwrap();
-    assert!(parsed.media[0].source_url.contains("1280x720"));
-    assert_eq!(parsed.media[0].width, Some(1280));
-    assert_eq!(parsed.media[0].height, Some(720));
+    // 默认清晰度上限 480p：测试样例里短边 <= 480 的最高源是 360p。
+    assert!(parsed.media[0].source_url.contains("640x360"));
+    assert_eq!(parsed.media[0].width, Some(640));
+    assert_eq!(parsed.media[0].height, Some(360));
     assert_eq!(parsed.media[0].duration_secs, Some(15));
-    assert_eq!(parsed.media[0].size, Some(4_080_000));
-    assert!(parsed.media[0].cache_key.ends_with(":720p"));
+    assert_eq!(parsed.media[0].size, Some(1_560_000));
+    assert!(parsed.media[0].cache_key.ends_with(":480p"));
 
     let parsed = provider
         .parse(&ParseRequest {
             url: "https://x.com/a/status/123456789012".into(),
             options: ParseOptions {
-                quality: Some(480),
+                quality: Some(720),
                 ..Default::default()
             },
         })
         .await
         .unwrap();
-    assert!(parsed.media[0].source_url.contains("640x360"));
-    assert!(parsed.media[0].cache_key.ends_with(":480p"));
+    assert!(parsed.media[0].source_url.contains("1280x720"));
+    assert!(parsed.media[0].cache_key.ends_with(":720p"));
 }
 
 #[tokio::test]

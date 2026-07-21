@@ -208,7 +208,7 @@ impl Provider for NeteaseProvider {
             NeteaseKind::Mv => {
                 let detail = self.get("/mv/detail", &[("mvid", &id)]).await?;
                 let mv = detail.get("data").unwrap_or(&detail);
-                let quality = request.options.quality.unwrap_or(720).to_string();
+                let quality = request.options.quality_or_default().to_string();
                 let urls = self.get("/mv/url", &[("id", &id), ("r", &quality)]).await?;
                 let media_url = get_str(&urls, "/data/url")
                     .ok_or_else(|| ProviderError::Unavailable(request.url.clone()))?;
