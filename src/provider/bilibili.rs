@@ -44,7 +44,7 @@ impl BilibiliProvider {
             },
             cdn: config.bilibili_cdn,
             matcher: Regex::new(
-                r"(?i)(?:bilibili\.com|b23\.tv|(?:^|\s)BV[0-9A-Za-z]{10}|(?:^|\s)av\d+)",
+                r"(?i)(?:bilibili\.com|b23\.tv|(?:^|\s)BV[0-9A-Za-z]{10}|(?:^|\s)av\d{2,}(?:\?|$))",
             )
             .expect("valid Bilibili matcher"),
             bvid: Regex::new(r"(?i)(BV[0-9A-Za-z]{10})").expect("valid BV regex"),
@@ -82,6 +82,13 @@ impl BilibiliProvider {
     async fn resolve(&self, raw: &str) -> ProviderResult<String> {
         if let Some(c) = self.bvid.captures(raw) {
             return Ok(format!("https://www.bilibili.com/video/{}", &c[1]));
+        }
+        // 裸 av 号没有域名，不能走 HEAD 重定向，直接拼出标准视频地址。
+        if let Some(c) = Regex::new(r"(?i)^av(\d{2,})(?:\?|$)")
+            .expect("valid bare av regex")
+            .captures(raw)
+        {
+            return Ok(format!("https://www.bilibili.com/video/av{}", &c[1]));
         }
         let url = if raw.starts_with("http") {
             raw.to_string()
@@ -131,12 +138,13 @@ impl BilibiliProvider {
         url: &str,
         options: &ParseOptions,
     ) -> ProviderResult<ParsedContent> {
-        if let Some(captures) = Regex::new(r"(?i)(?:ep|ss)(\d+)")
+        // ep/ss 必须是独立路径段，否则会命中 BV1ss411… 这类普通视频的 BV 号。
+        if let Some(captures) = Regex::new(r"(?i)/(ep|ss)(\d+)(?:[/?#]|$)")
             .expect("valid bangumi regex")
             .captures(url)
         {
-            let id = captures[1].to_string();
-            let key = if url.to_ascii_lowercase().contains("ss") {
+            let id = captures[2].to_string();
+            let key = if captures[1].eq_ignore_ascii_case("ss") {
                 "season_id"
             } else {
                 "ep_id"

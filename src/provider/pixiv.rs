@@ -63,42 +63,60 @@ impl PixivProvider {
         Ok(Some(token))
     }
 
+    async fn app_api_get(
+        &self,
+        endpoint: &str,
+        id: &str,
+        source: &str,
+    ) -> ProviderResult<Option<Value>> {
+        // access token 约一小时过期；首次失败时清掉缓存，用 refresh token 换新后重试一次。
+        for attempt in 0..2 {
+            let Some(token) = self.app_token().await? else {
+                return Ok(None);
+            };
+            let response = self
+                .client
+                .get(endpoint)
+                .query(&[("illust_id", id)])
+                .bearer_auth(token)
+                .header("App-OS", "android")
+                .header("App-OS-Version", "11")
+                .header("App-Version", "5.0.234")
+                .send()
+                .await
+                .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+            match json_response(response, source).await {
+                Ok(root) => return Ok(Some(root)),
+                Err(error) if attempt == 0 => {
+                    *self.access_token.lock().await = None;
+                    tracing::debug!(%error, "Pixiv App API 请求失败，刷新 token 后重试");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("app_api_get 循环总会返回")
+    }
+
     async fn app_detail(&self, id: &str) -> ProviderResult<Option<Value>> {
-        let Some(token) = self.app_token().await? else {
-            return Ok(None);
-        };
-        let response = self
-            .client
-            .get("https://app-api.pixiv.net/v1/illust/detail")
-            .query(&[("illust_id", id)])
-            .bearer_auth(token)
-            .header("App-OS", "android")
-            .header("App-OS-Version", "11")
-            .header("App-Version", "5.0.234")
-            .send()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let root = json_response(response, "Pixiv App API").await?;
-        Ok(root.get("illust").cloned())
+        Ok(self
+            .app_api_get(
+                "https://app-api.pixiv.net/v1/illust/detail",
+                id,
+                "Pixiv App API",
+            )
+            .await?
+            .and_then(|root| root.get("illust").cloned()))
     }
 
     async fn app_ugoira(&self, id: &str) -> ProviderResult<Option<Value>> {
-        let Some(token) = self.app_token().await? else {
-            return Ok(None);
-        };
-        let response = self
-            .client
-            .get("https://app-api.pixiv.net/v1/ugoira/metadata")
-            .query(&[("illust_id", id)])
-            .bearer_auth(token)
-            .header("App-OS", "android")
-            .header("App-OS-Version", "11")
-            .header("App-Version", "5.0.234")
-            .send()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let root = json_response(response, "Pixiv Ugoira API").await?;
-        Ok(root.get("ugoira_metadata").cloned())
+        Ok(self
+            .app_api_get(
+                "https://app-api.pixiv.net/v1/ugoira/metadata",
+                id,
+                "Pixiv Ugoira API",
+            )
+            .await?
+            .and_then(|root| root.get("ugoira_metadata").cloned()))
     }
 }
 

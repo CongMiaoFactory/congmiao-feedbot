@@ -212,7 +212,12 @@ impl ChatStatus {
         let _ = self.bot.send_chat_action(self.chat_id, action).await;
     }
 
-    fn finish(self) {
+    fn finish(self) {}
+}
+
+// 发送流程出错提前返回时也必须停掉刷新任务，否则会永远向会话发送状态。
+impl Drop for ChatStatus {
+    fn drop(&mut self) {
         self.action_task.abort();
     }
 }
@@ -464,7 +469,10 @@ async fn send_content(
             _ => false,
         })
     {
-        for chunk in selected.chunks(10) {
+        let mut offset = 0;
+        for size in media_group_sizes(selected.len()) {
+            let chunk = &selected[offset..offset + size];
+            offset += size;
             let mut group = Vec::new();
             let mut prepared = Vec::new();
             for (i, item) in chunk.iter().enumerate() {
@@ -711,7 +719,11 @@ async fn input_for_item(
     options: &ParseOptions,
     prepared: &mut Vec<crate::media::PreparedMedia>,
 ) -> Result<(InputFile, MediaItem)> {
-    if let Some((_, id)) = lookup_cached_file(state, item, options.file_mode).await? {
+    // 媒体组的条目类型由 item.kind 决定，document 等异类 file_id 不能混入，
+    // 否则整组 sendMediaGroup 都会被 Telegram 拒绝。
+    if let Some((cached_kind, id)) = lookup_cached_file(state, item, options.file_mode).await?
+        && cached_kind == item.kind
+    {
         return Ok((
             InputFile::file_id(teloxide::types::FileId(id)),
             item.clone(),
@@ -1100,9 +1112,23 @@ fn filter_supported_urls(registry: &ProviderRegistry, urls: Vec<String>) -> Vec<
     supported
 }
 
+/// sendMediaGroup 每组要求 2-10 项；把媒体均匀分组，避免出现单独 1 项的尾组。
+pub fn media_group_sizes(total: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let group_count = total.div_ceil(10);
+    let base_size = total / group_count;
+    let extra = total % group_count;
+    (0..group_count)
+        .map(|index| base_size + usize::from(index < extra))
+        .collect()
+}
+
 pub fn extract_urls(text: &str) -> Vec<String> {
+    // 裸 av 号要求至少两位数字，避免把 “AV1” 编解码器等普通词误当链接。
     let re = Regex::new(
-        r"(?i)(?:https?://[^\s<>，。！？、]+|(?:BV[0-9A-Za-z]{10})(?:\?[^\s<>，。！？、]*)?)",
+        r"(?i)(?:https?://[^\s<>，。！？、]+|\b(?:BV[0-9A-Za-z]{10}|av\d{2,})\b(?:\?[^\s<>，。！？、]*)?)",
     )
     .expect("valid URL extractor");
     let mut out = Vec::new();
@@ -1144,11 +1170,15 @@ fn parse_options(text: &str) -> ParseOptions {
         || lower.ends_with("+sp")
         || lower.starts_with("/spoiler")
         || lower.starts_with("/mask");
+    // 清晰度只接受独立参数（如 `/video 480p`），避免误读链接里的数字串。
+    let quality = lower.split_whitespace().find_map(|token| {
+        let value = token.strip_suffix('p').unwrap_or(token);
+        matches!(value, "360" | "480" | "720" | "1080")
+            .then(|| value.parse().ok())
+            .flatten()
+    });
     ParseOptions {
-        quality: Regex::new(r"(?i)(360|480|720|1080)p?")
-            .ok()
-            .and_then(|r| r.captures(text))
-            .and_then(|c| c[1].parse().ok()),
+        quality,
         file_mode: lower.starts_with("/file"),
         cover_only: lower.starts_with("/cover"),
         force_spoiler,

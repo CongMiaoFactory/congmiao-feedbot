@@ -228,6 +228,24 @@ impl MediaProcessor {
         let output = self
             .temp_dir
             .join(format!("{safe}-{}", sanitize(&item.filename)));
+        let prepared = self
+            .prepare_into(content, item, quality, &safe, &output)
+            .await;
+        if prepared.is_err() {
+            // 下载或转码失败时不留半成品，temp 目录不随错误累积垃圾。
+            let _ = tokio::fs::remove_file(&output).await;
+        }
+        prepared
+    }
+
+    async fn prepare_into(
+        &self,
+        content: &ParsedContent,
+        item: &MediaItem,
+        quality: u32,
+        safe: &str,
+        output: &Path,
+    ) -> Result<PreparedMedia> {
         let download_limit = if matches!(item.kind, MediaKind::Video | MediaKind::Animation) {
             2_000_000_000
         } else {
@@ -252,13 +270,13 @@ impl MediaProcessor {
                 .convert_ugoira(
                     &archive,
                     item.secondary_url.as_deref().unwrap_or("ugoira:[]"),
-                    &output,
+                    output,
                 )
                 .await;
             let _ = tokio::fs::remove_file(archive).await;
             conversion?;
         } else if content.platform == crate::model::Platform::YouTube {
-            self.download_youtube(&content.canonical_url, &output, quality)
+            self.download_youtube(&content.canonical_url, output, quality)
                 .await?;
         } else {
             let primary = self.temp_dir.join(format!("{safe}.part1"));
@@ -281,30 +299,30 @@ impl MediaProcessor {
                         download_limit,
                     )
                     .await?;
-                    self.merge(&primary, &secondary, &output).await
+                    self.merge(&primary, &secondary, output).await
                 }
                 .await;
                 let _ = tokio::fs::remove_file(&secondary).await;
                 let _ = tokio::fs::remove_file(&primary).await;
                 preparation?;
-            } else if let Err(error) = tokio::fs::rename(&primary, &output).await {
+            } else if let Err(error) = tokio::fs::rename(&primary, output).await {
                 let _ = tokio::fs::remove_file(&primary).await;
                 return Err(error.into());
             }
         }
         let mut prepared_item = item.clone();
         let mut video_metadata = if item.kind == MediaKind::Video {
-            let mut metadata = self.probe_video(&output).await?;
+            let mut metadata = self.probe_video(output).await?;
             if !video_is_telegram_compatible(&metadata) {
-                self.normalize_video(&output).await?;
-                metadata = self.probe_video(&output).await?;
+                self.normalize_video(output).await?;
+                metadata = self.probe_video(output).await?;
             }
             Some(metadata)
         } else {
             None
         };
         let force_document = if item.kind == MediaKind::Photo {
-            let path = output.clone();
+            let path = output.to_path_buf();
             tokio::task::spawn_blocking(move || photo_exceeds_telegram_dimensions(&path))
                 .await?
                 .unwrap_or(false)
@@ -317,20 +335,19 @@ impl MediaProcessor {
             } else {
                 self.max_size
             };
-        if tokio::fs::metadata(&output).await?.len() > item_limit
+        if tokio::fs::metadata(output).await?.len() > item_limit
             && matches!(item.kind, MediaKind::Video | MediaKind::Animation)
         {
-            self.compress_video(&output).await?;
+            self.compress_video(output).await?;
             if item.kind == MediaKind::Video {
-                video_metadata = Some(self.probe_video(&output).await?);
+                video_metadata = Some(self.probe_video(output).await?);
             }
         }
-        if tokio::fs::metadata(&output).await?.len() > item_limit && item.kind == MediaKind::Photo {
-            self.compress_image(&output).await?;
+        if tokio::fs::metadata(output).await?.len() > item_limit && item.kind == MediaKind::Photo {
+            self.compress_image(output).await?;
         }
-        let size = tokio::fs::metadata(&output).await?.len();
+        let size = tokio::fs::metadata(output).await?.len();
         if size > item_limit {
-            let _ = tokio::fs::remove_file(&output).await;
             bail!("媒体文件 {} MB 超过 Telegram 限制", size / 1024 / 1024);
         }
         if let Some(metadata) = video_metadata {
@@ -340,7 +357,7 @@ impl MediaProcessor {
         }
         Ok(PreparedMedia {
             item: prepared_item,
-            path: output,
+            path: output.to_path_buf(),
             force_document,
         })
     }
@@ -733,7 +750,7 @@ impl MediaProcessor {
                     .unwrap_or(60) as f64
                     / 1000.0;
                 let path = directory.join(name).canonicalize()?;
-                let display = path.display().to_string().replace('\\', "/");
+                let display = concat_escape(&path);
                 list.push_str(&format!("file '{display}'\nduration {delay:.3}\n"));
             }
             if let Some(last) = items
@@ -742,7 +759,7 @@ impl MediaProcessor {
                 .and_then(serde_json::Value::as_str)
             {
                 let path = directory.join(last).canonicalize()?;
-                let display = path.display().to_string().replace('\\', "/");
+                let display = concat_escape(&path);
                 list.push_str(&format!("file '{display}'\n"));
             }
         }
@@ -782,6 +799,14 @@ async fn ensure_thumbnail_size(path: &Path) -> Result<()> {
         bail!("媒体封面超过 Telegram 200KB 限制");
     }
     Ok(())
+}
+
+/// FFmpeg concat 列表的单引号字符串中，`'` 必须写成 `'\''`。
+fn concat_escape(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "/")
+        .replace('\'', r"'\''")
 }
 
 fn parse_duration(value: &str) -> Option<u64> {

@@ -7,7 +7,7 @@ use congmiao_feedbot::{
     login::{LoginPoll, LoginService},
     provider::{BilibiliProvider, NeteaseProvider, PixivProvider, XProvider},
     storage::Storage,
-    telegram::{caption, extract_urls, media_has_spoiler},
+    telegram::{caption, extract_urls, media_group_sizes, media_has_spoiler},
 };
 use reqwest::Client;
 use wiremock::{
@@ -79,6 +79,32 @@ fn extracts_and_deduplicates_urls() {
         extract_urls(text),
         vec!["https://x.com/a/status/123456789012", "BV1xx411c7mD"]
     );
+}
+
+#[test]
+fn extracts_bare_av_ids_but_not_codec_names() {
+    assert_eq!(extract_urls("经典视频 av170001 值得一看"), vec!["av170001"]);
+    // “AV1” 是编解码器名称，不能当成视频号；紧贴字母的 BV/av 串同样不算。
+    assert!(extract_urls("AV1 编码比 H.264 高效").is_empty());
+    assert!(
+        extract_urls("代码变量 xBV1xx411c7mDy 与 av12abc 均非链接")
+            .iter()
+            .all(|url| !url.starts_with("BV") && !url.starts_with("av"))
+    );
+}
+
+#[test]
+fn media_groups_never_contain_a_single_item() {
+    assert!(media_group_sizes(0).is_empty());
+    assert_eq!(media_group_sizes(2), vec![2]);
+    assert_eq!(media_group_sizes(10), vec![10]);
+    // 11 项若按 10 个一切会留下孤儿项，Telegram 会拒绝 1 项的媒体组。
+    assert_eq!(media_group_sizes(11), vec![6, 5]);
+    for total in 2..=100 {
+        let sizes = media_group_sizes(total);
+        assert_eq!(sizes.iter().sum::<usize>(), total);
+        assert!(sizes.iter().all(|size| (2..=10).contains(size)), "{total}");
+    }
 }
 
 #[test]
@@ -378,6 +404,93 @@ async fn bilibili_provider_parses_video_and_dash_streams() {
         mirrored.media[0].secondary_url.as_deref(),
         Some("https://upos-sz-mirrorali.bilivideo.com/audio.m4s")
     );
+}
+
+#[tokio::test]
+async fn bilibili_bvid_containing_ss_is_not_treated_as_bangumi() {
+    let server = MockServer::start().await;
+    // 只挂普通视频接口；若被误判成番剧会请求 /pgc/view/web/season 而失败。
+    Mock::given(method("GET"))
+        .and(path("/x/web-interface/view"))
+        .and(query_param("bvid", "BV1ss411c7mD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "bvid": "BV1ss411c7mD",
+                "cid": 42,
+                "title": "普通视频",
+                "owner": {"mid": 1, "name": "UP"},
+                "stat": {}
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/player/playurl"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"durl": [{"url": "https://media/video.mp4", "size": 1}]}
+        })))
+        .mount(&server)
+        .await;
+    let mut c = config();
+    c.bilibili_api_base = server.uri();
+    let parsed = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "https://www.bilibili.com/video/BV1ss411c7mD".into(),
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(parsed.title, "普通视频");
+    assert_eq!(parsed.media[0].source_url, "https://media/video.mp4");
+}
+
+#[tokio::test]
+async fn bilibili_bangumi_episode_resolves_through_season_api() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/pgc/view/web/season"))
+        .and(query_param("ep_id", "836014"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "result": {"episodes": [{"id": 836014, "bvid": "BV1xx411c7mD"}]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/web-interface/view"))
+        .and(query_param("bvid", "BV1xx411c7mD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "bvid": "BV1xx411c7mD",
+                "cid": 42,
+                "title": "番剧正片",
+                "owner": {"mid": 1, "name": "UP"},
+                "stat": {}
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/player/playurl"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"durl": [{"url": "https://media/ep.mp4", "size": 1}]}
+        })))
+        .mount(&server)
+        .await;
+    let mut c = config();
+    c.bilibili_api_base = server.uri();
+    let parsed = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "https://www.bilibili.com/bangumi/play/ep836014?from=search".into(),
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(parsed.title, "番剧正片");
 }
 
 #[tokio::test]

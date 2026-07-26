@@ -9,14 +9,12 @@ use tokio::sync::Mutex;
 #[derive(Clone, Default)]
 pub struct AppCache {
     local: Arc<Mutex<HashMap<String, (String, Instant)>>>,
-    locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl AppCache {
     pub fn new() -> Self {
         Self {
             local: Default::default(),
-            locks: Default::default(),
         }
     }
 
@@ -34,18 +32,12 @@ impl AppCache {
 
     pub async fn set(&self, key: &str, value: String, ttl: Duration) {
         let mut local = self.local.lock().await;
+        // 过期条目只在同 key 读取时清除，写入前顺手回收，避免长期运行内存增长。
+        if local.len() >= 512 {
+            let now = Instant::now();
+            local.retain(|_, (_, expiry)| *expiry > now);
+        }
         local.insert(key.into(), (value, Instant::now() + ttl));
-    }
-
-    pub async fn lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.locks.lock().await;
-            locks
-                .entry(key.into())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        lock.lock_owned().await
     }
 
     pub async fn allow(&self, subject: &str, count: u64, ttl: Duration) -> bool {
