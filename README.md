@@ -356,7 +356,9 @@ BILIBILI_CDN=ali
 - `/file <url>`：按文件发送
 - `/cover <url>`：只发封面
 - 链接后加 `+sp`：本次强制遮罩，例如 `https://www.pixiv.net/artworks/123456 +sp`
-- 也可回复一条含链接的消息，单独发送 `+sp`
+- Pixiv 等多图链接后加 `+pN`：只发送第 N 页，例如 `https://www.pixiv.net/artworks/123456+p2` 或 `... 123456 +p2`
+- 也可回复一条含链接的消息，单独发送 `+sp` / `+p2`
+- 可组合：`https://www.pixiv.net/artworks/123456+p2+sp`
 - 开启 Inline Mode 后：`@你的Bot <url>`
 
 ## 9. 自检与排障

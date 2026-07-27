@@ -115,6 +115,8 @@ pub struct ParseOptions {
     pub file_mode: bool,
     pub cover_only: bool,
     pub force_spoiler: bool,
+    /// 1-based 页码；用于 Pixiv 等多图内容只发送指定页。
+    pub page: Option<u32>,
 }
 
 impl ParseOptions {

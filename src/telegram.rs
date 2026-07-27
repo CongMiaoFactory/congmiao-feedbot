@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use teloxide::{
@@ -92,7 +92,7 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
     if text == "/start" || text == "/help" {
         bot.send_message(
             msg.chat.id,
-            "发送 X、YouTube、Pixiv、哔哩哔哩或网易云链接即可解析；在链接后加 +sp 可手动开启媒体遮罩。\n命令：/parse、/video [清晰度，默认 480p]、/file、/cover、/login [bili|netease]",
+            "发送 X、YouTube、Pixiv、哔哩哔哩或网易云链接即可解析；链接后加 +sp 可遮罩，Pixiv 等多图可加 +p2 只发第 2 页。\n命令：/parse、/video [清晰度，默认 480p]、/file、/cover、/login [bili|netease]",
         )
         .await?;
         return Ok(());
@@ -101,24 +101,36 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
         handle_login(bot, &msg, &state, text).await?;
         return Ok(());
     }
-    let options = parse_options(text);
+    let global_options = parse_options(text);
     let mut urls = extract_message_urls(&msg);
-    if options.force_spoiler {
-        for url in &mut urls {
-            if url.to_ascii_lowercase().ends_with("+sp") {
-                url.truncate(url.len() - 3);
-            }
-        }
-    }
     if urls.is_empty()
-        && options.force_spoiler
+        && (global_options.force_spoiler || global_options.page.is_some())
         && let Some(replied) = msg.reply_to_message()
     {
         urls = extract_message_urls(replied);
     }
-    // 先按平台匹配，只保留本 Bot 能处理的链接；未匹配到则直接返回，不发状态、不解析。
-    let urls = filter_supported_urls(&state.registry, urls);
-    if urls.is_empty() {
+    // 剥离链接后缀（+p2 / +sp），先匹配平台，再解析；未匹配到则不发状态。
+    let requests: Vec<ParseRequest> = urls
+        .into_iter()
+        .filter_map(|url| {
+            let (clean_url, flags) = strip_url_flags(&url);
+            if !state.registry.supports(&clean_url) {
+                return None;
+            }
+            let mut options = global_options.clone();
+            if flags.force_spoiler {
+                options.force_spoiler = true;
+            }
+            if let Some(page) = flags.page {
+                options.page = Some(page);
+            }
+            Some(ParseRequest {
+                url: clean_url,
+                options,
+            })
+        })
+        .collect();
+    if requests.is_empty() {
         if msg.chat.is_private() && text.starts_with('/') {
             bot.send_message(msg.chat.id, "未找到支持的链接").await?;
         }
@@ -142,18 +154,11 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
             .await?;
         return Ok(());
     }
-    let requests = urls
-        .into_iter()
-        .map(|url| ParseRequest {
-            url,
-            options: options.clone(),
-        })
-        .collect();
     // 匹配到支持链接后再显示 Telegram 原生会话状态。
     let status = ChatStatus::start(bot.clone(), msg.chat.id, ChatAction::Typing).await;
     for result in parse_cached(&state, requests).await {
         match result {
-            Ok(content) => {
+            Ok((content, options)) => {
                 status.set(chat_action_for_content(&content)).await;
                 if let Err(err) = send_content(&bot, &msg, &state, content, &options).await {
                     error!(?err, "发送内容失败");
@@ -379,8 +384,10 @@ async fn handle_login(bot: Bot, msg: &Message, state: &BotState, text: &str) -> 
 async fn parse_cached(
     state: &BotState,
     requests: Vec<ParseRequest>,
-) -> Vec<ProviderResult<ParsedContent>> {
+) -> Vec<ProviderResult<(ParsedContent, ParseOptions)>> {
     futures_util::future::join_all(requests.into_iter().map(|request| async move {
+        let options = request.options.clone();
+        // 页码只影响发送选择，不影响上游解析结果，因此不进入解析缓存键。
         let raw_key = format!(
             "{}:{:?}:{}:{}:{}",
             request.url,
@@ -393,7 +400,7 @@ async fn parse_cached(
         if let Some(value) = state.cache.get(&key).await
             && let Ok(content) = serde_json::from_str(&value)
         {
-            return Ok(content);
+            return Ok((content, options));
         }
         let result = state.registry.parse_one(request).await;
         if let Ok(content) = &result
@@ -409,7 +416,7 @@ async fn parse_cached(
             };
             state.cache.set(&key, value, ttl).await;
         }
-        result
+        result.map(|content| (content, options))
     }))
     .await
 }
@@ -432,16 +439,7 @@ async fn send_content(
             .await?;
         return Ok(());
     }
-    let selected: Vec<_> = if options.cover_only {
-        content
-            .media
-            .iter()
-            .filter(|m| m.kind == MediaKind::Photo)
-            .take(1)
-            .collect()
-    } else {
-        content.media.iter().collect()
-    };
+    let selected = select_media_items(&content, options)?;
     if selected.is_empty() {
         if let Some(url) = content.media.iter().find_map(|m| m.thumbnail_url.clone()) {
             bot.send_photo(msg.chat.id, InputFile::url(url.parse()?))
@@ -458,6 +456,7 @@ async fn send_content(
         }
         return Ok(());
     }
+
     if !options.file_mode
         && selected.len() > 1
         && selected.iter().all(|item| match item.kind {
@@ -968,22 +967,63 @@ async fn cache_message(state: &BotState, item: &MediaItem, msg: &Message) {
 }
 
 async fn handle_inline(bot: Bot, query: InlineQuery, state: BotState) -> ResponseResult<()> {
-    let urls = filter_supported_urls(&state.registry, extract_urls(&query.query));
-    let Some(url) = urls.first() else {
+    let requests: Vec<_> = extract_urls(&query.query)
+        .into_iter()
+        .filter_map(|url| {
+            let (clean_url, flags) = strip_url_flags(&url);
+            if !state.registry.supports(&clean_url) {
+                return None;
+            }
+            Some(ParseRequest {
+                url: clean_url,
+                options: ParseOptions {
+                    force_spoiler: flags.force_spoiler,
+                    page: flags.page,
+                    ..Default::default()
+                },
+            })
+        })
+        .collect();
+    let Some(request) = requests.into_iter().next() else {
         bot.answer_inline_query(query.id, Vec::<InlineQueryResult>::new())
             .cache_time(1)
             .await?;
         return Ok(());
     };
-    let result = state
-        .registry
-        .parse_one(ParseRequest {
-            url: url.clone(),
-            options: Default::default(),
-        })
-        .await;
+    let page = request.options.page;
+    let result = state.registry.parse_one(request).await;
     let results = match result {
-        Ok(content) => vec![inline_result(&state, &content).await],
+        Ok(mut content) => {
+            if let Some(page) = page {
+                match select_media_items(
+                    &content,
+                    &ParseOptions {
+                        page: Some(page),
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(selected) => {
+                        content.media = selected.into_iter().cloned().collect();
+                    }
+                    Err(err) => {
+                        bot.answer_inline_query(
+                            query.id,
+                            vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+                                "error",
+                                "页码无效",
+                                InputMessageContent::Text(InputMessageContentText::new(
+                                    err.to_string(),
+                                )),
+                            ))],
+                        )
+                        .cache_time(1)
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            vec![inline_result(&state, &content).await]
+        }
         Err(err) => vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
             "error",
             "解析失败",
@@ -1102,14 +1142,74 @@ fn article_result(content: &ParsedContent, title: String) -> InlineQueryResult {
     ))
 }
 
-fn filter_supported_urls(registry: &ProviderRegistry, urls: Vec<String>) -> Vec<String> {
-    let mut supported = Vec::new();
-    for url in urls {
-        if registry.supports(&url) && !supported.iter().any(|existing| existing == &url) {
-            supported.push(url);
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UrlFlags {
+    pub force_spoiler: bool,
+    pub page: Option<u32>,
+}
+
+/// 从链接末尾剥离 `+p2` / `+sp` 等标志，得到干净 URL 与选项。
+pub fn strip_url_flags(url: &str) -> (String, UrlFlags) {
+    let mut clean = url.trim().to_string();
+    let mut flags = UrlFlags::default();
+    let page_suffix = Regex::new(r"(?i)\+p(\d+)$").expect("valid page flag regex");
+    loop {
+        let lower = clean.to_ascii_lowercase();
+        if lower.ends_with("+sp") {
+            clean.truncate(clean.len().saturating_sub(3));
+            flags.force_spoiler = true;
+            continue;
         }
+        if let Some(captures) = page_suffix.captures(&clean) {
+            let full = captures.get(0).expect("regex match");
+            if full.end() == clean.len()
+                && let Ok(page) = captures[1].parse::<u32>()
+                && page >= 1
+            {
+                flags.page = Some(page);
+                clean.truncate(full.start());
+                continue;
+            }
+        }
+        break;
     }
-    supported
+    (clean, flags)
+}
+
+pub fn select_media_items<'a>(
+    content: &'a ParsedContent,
+    options: &ParseOptions,
+) -> Result<Vec<&'a MediaItem>> {
+    if options.cover_only {
+        return Ok(content
+            .media
+            .iter()
+            .filter(|item| item.kind == MediaKind::Photo)
+            .take(1)
+            .collect());
+    }
+    let Some(page) = options.page else {
+        return Ok(content.media.iter().collect());
+    };
+    // Pixiv 等多图：页码按图片 1-based；若没有图片则回退到全部媒体序号。
+    let photos: Vec<_> = content
+        .media
+        .iter()
+        .filter(|item| item.kind == MediaKind::Photo)
+        .collect();
+    let pool = if photos.is_empty() {
+        content.media.iter().collect::<Vec<_>>()
+    } else {
+        photos
+    };
+    if pool.is_empty() {
+        bail!("当前内容没有可按页选择的媒体");
+    }
+    let index = usize::try_from(page).unwrap_or(0);
+    if index == 0 || index > pool.len() {
+        bail!("指定页码 {page} 超出范围（共 {} 页）", pool.len());
+    }
+    Ok(vec![pool[index - 1]])
 }
 
 /// sendMediaGroup 每组要求 2-10 项；把媒体均匀分组，避免出现单独 1 项的尾组。
@@ -1177,11 +1277,20 @@ fn parse_options(text: &str) -> ParseOptions {
             .then(|| value.parse().ok())
             .flatten()
     });
+    // 独立页码参数：`+p2` / 回复链接时单独发 `+p3`。
+    let page = lower.split_whitespace().find_map(|token| {
+        token
+            .strip_prefix("+p")
+            .filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|value| value.parse().ok())
+            .filter(|&value| value >= 1)
+    });
     ParseOptions {
         quality,
         file_mode: lower.starts_with("/file"),
         cover_only: lower.starts_with("/cover"),
         force_spoiler,
+        page,
     }
 }
 

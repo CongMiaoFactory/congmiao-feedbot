@@ -7,7 +7,10 @@ use congmiao_feedbot::{
     login::{LoginPoll, LoginService},
     provider::{BilibiliProvider, NeteaseProvider, PixivProvider, XProvider},
     storage::Storage,
-    telegram::{caption, extract_urls, media_group_sizes, media_has_spoiler},
+    telegram::{
+        caption, extract_urls, media_group_sizes, media_has_spoiler, select_media_items,
+        strip_url_flags,
+    },
 };
 use reqwest::Client;
 use wiremock::{
@@ -243,6 +246,45 @@ async fn pixiv_provider_supports_multiple_pages() {
     assert!(parsed.text.contains("#插画"));
     assert!(parsed.sensitive);
     assert!(media_has_spoiler(&c, &parsed));
+
+    let page2 = select_media_items(
+        &parsed,
+        &ParseOptions {
+            page: Some(2),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].source_url, "https://i.pximg.net/2.jpg");
+    assert!(page2[0].cache_key.ends_with(":p1"));
+
+    let err = select_media_items(
+        &parsed,
+        &ParseOptions {
+            page: Some(9),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("超出范围"));
+}
+
+#[test]
+fn strips_page_and_spoiler_flags_from_urls() {
+    let (url, flags) = strip_url_flags("https://www.pixiv.net/artworks/123+p2+sp");
+    assert_eq!(url, "https://www.pixiv.net/artworks/123");
+    assert_eq!(flags.page, Some(2));
+    assert!(flags.force_spoiler);
+
+    let (url, flags) = strip_url_flags("https://www.pixiv.net/artworks/123+sp+p3");
+    assert_eq!(url, "https://www.pixiv.net/artworks/123");
+    assert_eq!(flags.page, Some(3));
+    assert!(flags.force_spoiler);
+
+    let (url, flags) = strip_url_flags("https://www.pixiv.net/artworks/123");
+    assert_eq!(url, "https://www.pixiv.net/artworks/123");
+    assert_eq!(flags, Default::default());
 }
 
 #[tokio::test]
