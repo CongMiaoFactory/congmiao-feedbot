@@ -117,6 +117,8 @@ pub struct ParseOptions {
     pub force_spoiler: bool,
     /// 1-based 页码；用于 Pixiv 等多图内容只发送指定页。
     pub page: Option<u32>,
+    /// 回复 Bot 媒体消息时，由持久化映射指定要发送的原媒体。
+    pub media_cache_key: Option<String>,
 }
 
 impl ParseOptions {

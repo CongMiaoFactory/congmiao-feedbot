@@ -23,7 +23,7 @@ use crate::{
     Config, MediaSpoilerMode, ProviderRegistry, RuntimeCredentials,
     cache::AppCache,
     login::{LoginPoll, LoginService},
-    media::{MediaProcessor, is_permanent_prepare_error, telegram_photo_dimensions_valid},
+    media::{MediaProcessor, is_permanent_prepare_error},
     model::*,
     storage::Storage,
 };
@@ -101,10 +101,31 @@ async fn handle_message(bot: Bot, msg: Message, state: BotState) -> ResponseResu
         handle_login(bot, &msg, &state, text).await?;
         return Ok(());
     }
-    let global_options = parse_options(text);
+    let mut global_options = parse_options(text);
     let mut urls = extract_message_urls(&msg);
     if urls.is_empty()
-        && (global_options.force_spoiler || global_options.page.is_some())
+        && global_options.file_mode
+        && let Some(replied) = msg.reply_to_message()
+    {
+        match state
+            .storage
+            .get_message_media(msg.chat.id.0, replied.id.0)
+            .await
+        {
+            Ok(Some(target)) => {
+                global_options.quality = global_options.quality.or(target.quality);
+                global_options.media_cache_key = Some(target.media_cache_key);
+                urls.push(target.canonical_url);
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "读取回复媒体映射失败，尝试从消息链接解析"),
+        }
+    }
+    if urls.is_empty()
+        && (global_options.force_spoiler
+            || global_options.page.is_some()
+            || global_options.file_mode
+            || global_options.cover_only)
         && let Some(replied) = msg.reply_to_message()
     {
         urls = extract_message_urls(replied);
@@ -389,11 +410,9 @@ async fn parse_cached(
         let options = request.options.clone();
         // 页码只影响发送选择，不影响上游解析结果，因此不进入解析缓存键。
         let raw_key = format!(
-            "{}:{:?}:{}:{}:{}",
+            "{}:{:?}:{}",
             request.url,
             request.options.quality,
-            request.options.file_mode,
-            request.options.cover_only,
             state.credentials.revision()
         );
         let key = format!("parsed:{}", hex::encode(Sha256::digest(raw_key.as_bytes())));
@@ -459,14 +478,9 @@ async fn send_content(
 
     if !options.file_mode
         && selected.len() > 1
-        && selected.iter().all(|item| match item.kind {
-            MediaKind::Video => true,
-            MediaKind::Photo => item
-                .width
-                .zip(item.height)
-                .is_some_and(|(width, height)| telegram_photo_dimensions_valid(width, height)),
-            _ => false,
-        })
+        && selected
+            .iter()
+            .all(|item| matches!(item.kind, MediaKind::Photo | MediaKind::Video))
     {
         let mut offset = 0;
         for size in media_group_sizes(selected.len()) {
@@ -475,8 +489,17 @@ async fn send_content(
             let mut group = Vec::new();
             let mut prepared = Vec::new();
             for (i, item) in chunk.iter().enumerate() {
-                let (input, resolved) =
-                    input_for_item(state, &content, item, options, &mut prepared).await?;
+                let (input, resolved, prepared_media) =
+                    match input_for_item(state, &content, item, options).await {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            for prepared_media in prepared.into_iter().flatten() {
+                                state.media.cleanup(prepared_media).await;
+                            }
+                            return Err(error);
+                        }
+                    };
+                prepared.push(prepared_media);
                 let c = if i == 0 {
                     Some(caption_text.clone())
                 } else {
@@ -510,19 +533,24 @@ async fn send_content(
                     }
                 });
             }
-            let sent = bot
+            let sent = match bot
                 .send_media_group(msg.chat.id, group)
                 .reply_parameters(ReplyParameters::new(msg.id))
-                .await?;
-            for ((item, message), prep) in chunk.iter().zip(sent.iter()).zip(
-                prepared
-                    .into_iter()
-                    .map(Some)
-                    .chain(std::iter::repeat_with(|| None)),
-            ) {
-                cache_message(state, item, message).await;
-                if let Some(p) = prep {
-                    state.media.cleanup(p).await;
+                .await
+            {
+                Ok(sent) => sent,
+                Err(error) => {
+                    for prepared_media in prepared.into_iter().flatten() {
+                        state.media.cleanup(prepared_media).await;
+                    }
+                    return Err(error.into());
+                }
+            };
+            for ((item, message), prep) in chunk.iter().zip(sent.iter()).zip(prepared) {
+                let telegram_item = prep.as_ref().map(|prepared| &prepared.item).unwrap_or(item);
+                cache_message(state, telegram_item, item, &content, options, message).await;
+                if let Some(prepared_media) = prep {
+                    state.media.cleanup(prepared_media).await;
                 }
             }
         }
@@ -532,7 +560,7 @@ async fn send_content(
         if let Some((cached_kind, file_id)) =
             lookup_cached_file(state, item, options.file_mode).await?
         {
-            send_cached(
+            let sent = send_cached(
                 bot,
                 item,
                 cached_kind,
@@ -548,6 +576,7 @@ async fn send_content(
                 },
             )
             .await?;
+            cache_message(state, item, item, &content, options, &sent).await;
             continue;
         }
         let prepared = prepare_media_with_refresh(state, &content, item, options).await;
@@ -594,14 +623,13 @@ async fn send_content(
             }
             _ => None,
         };
-        let sent = match prepared.as_ref() {
+        let send_result: Result<Message> = match prepared.as_ref() {
             Ok(p) => {
                 send_local(
                     bot,
                     &p.item,
                     &p.path,
                     options.file_mode,
-                    p.force_document,
                     SendOptions {
                         chat: msg.chat.id,
                         caption: if index == 0 { &caption_text } else { "" },
@@ -612,30 +640,51 @@ async fn send_content(
                         thumbnail: prepared_thumbnail.as_deref(),
                     },
                 )
-                .await?
+                .await
             }
             Err(err) => {
                 warn!(?err, "媒体准备失败，回退到预览");
                 if index == 0 {
                     if let Some(thumbnail) = &item.thumbnail_url {
-                        bot.send_photo(msg.chat.id, InputFile::url(thumbnail.parse()?))
+                        Ok(bot
+                            .send_photo(msg.chat.id, InputFile::url(thumbnail.parse()?))
                             .reply_parameters(ReplyParameters::new(msg.id))
                             .has_spoiler(spoiler)
                             .caption(&caption_text)
                             .parse_mode(ParseMode::Html)
-                            .await?
+                            .await?)
                     } else {
-                        bot.send_message(msg.chat.id, &caption_text)
+                        Ok(bot
+                            .send_message(msg.chat.id, &caption_text)
                             .reply_parameters(ReplyParameters::new(msg.id))
                             .parse_mode(ParseMode::Html)
-                            .await?
+                            .await?)
                     }
                 } else {
+                    if let Some(path) = prepared_thumbnail {
+                        state.media.cleanup_path(path).await;
+                    }
                     continue;
                 }
             }
         };
-        cache_message(state, item, &sent).await;
+        let sent = match send_result {
+            Ok(sent) => sent,
+            Err(error) => {
+                if let Ok(prepared_media) = prepared {
+                    state.media.cleanup(prepared_media).await;
+                }
+                if let Some(path) = prepared_thumbnail {
+                    state.media.cleanup_path(path).await;
+                }
+                return Err(error);
+            }
+        };
+        let telegram_item = prepared
+            .as_ref()
+            .map(|prepared| &prepared.item)
+            .unwrap_or(item);
+        cache_message(state, telegram_item, item, &content, options, &sent).await;
         if let Ok(p) = prepared {
             state.media.cleanup(p).await;
         }
@@ -653,7 +702,7 @@ async fn prepare_media_with_refresh(
     options: &ParseOptions,
 ) -> Result<crate::media::PreparedMedia> {
     let quality = options.quality_or_default();
-    match state.media.prepare(content, item, quality).await {
+    match prepare_media_for_options(state, content, item, quality, options.file_mode).await {
         Ok(prepared) => Ok(prepared),
         Err(initial_error) if is_permanent_prepare_error(&initial_error) => Err(initial_error),
         Err(initial_error) => {
@@ -675,11 +724,9 @@ async fn prepare_media_with_refresh(
             // 刷新后的签名地址写回本地解析缓存（按 canonical URL 键），缩短后续失败窗口。
             if let Ok(value) = serde_json::to_string(&refreshed) {
                 let raw_key = format!(
-                    "{}:{:?}:{}:{}:{}",
+                    "{}:{:?}:{}",
                     content.canonical_url,
                     options.quality,
-                    options.file_mode,
-                    options.cover_only,
                     state.credentials.revision()
                 );
                 let key = format!("parsed:{}", hex::encode(Sha256::digest(raw_key.as_bytes())));
@@ -700,14 +747,32 @@ async fn prepare_media_with_refresh(
                     })
                 })
                 .ok_or_else(|| anyhow!("重新解析后未找到对应媒体；初始错误: {initial_error}"))?;
-            state
-                .media
-                .prepare(&refreshed, refreshed_item, quality)
-                .await
-                .map_err(|error| {
-                    anyhow!("刷新地址后媒体准备仍失败: {error}; 初始错误: {initial_error}")
-                })
+            prepare_media_for_options(
+                state,
+                &refreshed,
+                refreshed_item,
+                quality,
+                options.file_mode,
+            )
+            .await
+            .map_err(|error| {
+                anyhow!("刷新地址后媒体准备仍失败: {error}; 初始错误: {initial_error}")
+            })
         }
+    }
+}
+
+async fn prepare_media_for_options(
+    state: &BotState,
+    content: &ParsedContent,
+    item: &MediaItem,
+    quality: u32,
+    file_mode: bool,
+) -> Result<crate::media::PreparedMedia> {
+    if file_mode && item.kind == MediaKind::Photo {
+        state.media.prepare_original(content, item, quality).await
+    } else {
+        state.media.prepare(content, item, quality).await
     }
 }
 
@@ -716,8 +781,7 @@ async fn input_for_item(
     content: &ParsedContent,
     item: &MediaItem,
     options: &ParseOptions,
-    prepared: &mut Vec<crate::media::PreparedMedia>,
-) -> Result<(InputFile, MediaItem)> {
+) -> Result<(InputFile, MediaItem, Option<crate::media::PreparedMedia>)> {
     // 媒体组的条目类型由 item.kind 决定，document 等异类 file_id 不能混入，
     // 否则整组 sendMediaGroup 都会被 Telegram 拒绝。
     if let Some((cached_kind, id)) = lookup_cached_file(state, item, options.file_mode).await?
@@ -726,16 +790,17 @@ async fn input_for_item(
         return Ok((
             InputFile::file_id(teloxide::types::FileId(id)),
             item.clone(),
+            None,
         ));
     }
-    if !item.requires_download && item.headers.is_empty() {
-        return Ok((InputFile::url(item.source_url.parse()?), item.clone()));
+    // 未缓存图片必须先下载并检查真实尺寸，不能仅依赖 provider 元数据或远程 URL。
+    if item.kind != MediaKind::Photo && !item.requires_download && item.headers.is_empty() {
+        return Ok((InputFile::url(item.source_url.parse()?), item.clone(), None));
     }
-    let p = prepare_media_with_refresh(state, content, item, options).await?;
-    let resolved = p.item.clone();
-    let input = InputFile::file(p.path.clone());
-    prepared.push(p);
-    Ok((input, resolved))
+    let prepared = prepare_media_with_refresh(state, content, item, options).await?;
+    let resolved = prepared.item.clone();
+    let input = InputFile::file(prepared.path.clone());
+    Ok((input, resolved, Some(prepared)))
 }
 
 #[derive(Clone, Copy)]
@@ -754,7 +819,6 @@ async fn send_local(
     item: &MediaItem,
     path: &std::path::Path,
     document: bool,
-    force_document: bool,
     options: SendOptions<'_>,
 ) -> Result<Message> {
     let SendOptions {
@@ -767,9 +831,8 @@ async fn send_local(
         thumbnail,
     } = options;
     let input = InputFile::file(path.to_path_buf()).file_name(item.filename.clone());
-    // Telegram documents cannot carry a spoiler. Sensitive visual media stays
-    // photo/video/animation even when /file was requested.
-    let req = if force_document || (document && !spoiler) || item.kind == MediaKind::Document {
+    // `/file` 明确要求原文件；Document 不支持 spoiler，但不能因此悄悄改回 Photo。
+    let req = if document || item.kind == MediaKind::Document {
         bot.send_document(chat, input)
             .reply_parameters(ReplyParameters::new(reply_to))
             .caption(caption)
@@ -912,34 +975,34 @@ async fn lookup_cached_file(
     file_mode: bool,
 ) -> Result<Option<(MediaKind, String)>> {
     let key = telegram_cache_key(item);
-    let primary = if file_mode && item.kind != MediaKind::Document {
-        MediaKind::Document
-    } else {
-        item.kind
-    };
-    if let Some(file_id) = state.storage.get_file_id(&key, kind_name(primary)).await? {
-        return Ok(Some((primary, file_id)));
-    }
-    // 超尺寸图片首次会以 document 入库，后续普通发送也要能命中。
-    if item.kind == MediaKind::Photo
-        && primary != MediaKind::Document
-        && let Some(file_id) = state.storage.get_file_id(&key, "document").await?
-    {
-        return Ok(Some((MediaKind::Document, file_id)));
-    }
-    if primary == MediaKind::Document
-        && item.kind != MediaKind::Document
-        && let Some(file_id) = state
+    if file_mode {
+        return Ok(state
             .storage
-            .get_file_id(&key, kind_name(item.kind))
+            .get_file_id(&key, "document")
             .await?
-    {
-        return Ok(Some((item.kind, file_id)));
+            .map(|file_id| (MediaKind::Document, file_id)));
     }
-    Ok(None)
+    if item.kind == MediaKind::Photo {
+        let preview_key = telegram_photo_preview_cache_key(item);
+        if let Some(file_id) = state.storage.get_file_id(&preview_key, "photo").await? {
+            return Ok(Some((MediaKind::Photo, file_id)));
+        }
+    }
+    Ok(state
+        .storage
+        .get_file_id(&key, kind_name(item.kind))
+        .await?
+        .map(|file_id| (item.kind, file_id)))
 }
 
-async fn cache_message(state: &BotState, item: &MediaItem, msg: &Message) {
+async fn cache_message(
+    state: &BotState,
+    telegram_item: &MediaItem,
+    source_item: &MediaItem,
+    content: &ParsedContent,
+    options: &ParseOptions,
+    msg: &Message,
+) {
     // 按 Telegram 实际返回的消息类型缓存，避免“图片被强制按文件发送”后写错 kind。
     let file = if let Some(photo) = msg.photo().and_then(|photos| photos.last()) {
         Some(("photo", &photo.file.id, &photo.file.unique_id))
@@ -954,15 +1017,29 @@ async fn cache_message(state: &BotState, item: &MediaItem, msg: &Message) {
             .map(|document| ("document", &document.file.id, &document.file.unique_id))
     };
     if let Some((kind, id, unique)) = file {
+        let cache_key =
+            if kind == "photo" && source_item.kind == MediaKind::Photo && !options.file_mode {
+                telegram_photo_preview_cache_key(source_item)
+            } else {
+                telegram_cache_key(telegram_item)
+            };
         let _ = state
             .storage
-            .put_file_id(
-                &telegram_cache_key(item),
-                kind,
-                id.0.as_str(),
-                Some(unique.0.as_str()),
-            )
+            .put_file_id(&cache_key, kind, id.0.as_str(), Some(unique.0.as_str()))
             .await;
+    }
+    if let Err(error) = state
+        .storage
+        .put_message_media(
+            msg.chat.id.0,
+            msg.id.0,
+            &content.canonical_url,
+            &source_item.cache_key,
+            Some(options.quality_or_default()),
+        )
+        .await
+    {
+        warn!(%error, "保存回复媒体映射失败");
     }
 }
 
@@ -1180,6 +1257,14 @@ pub fn select_media_items<'a>(
     content: &'a ParsedContent,
     options: &ParseOptions,
 ) -> Result<Vec<&'a MediaItem>> {
+    if let Some(cache_key) = &options.media_cache_key {
+        let item = content
+            .media
+            .iter()
+            .find(|item| &item.cache_key == cache_key)
+            .ok_or_else(|| anyhow!("被回复的原媒体已不存在或内容结构已变化"))?;
+        return Ok(vec![item]);
+    }
     if options.cover_only {
         return Ok(content
             .media
@@ -1291,6 +1376,7 @@ fn parse_options(text: &str) -> ParseOptions {
         cover_only: lower.starts_with("/cover"),
         force_spoiler,
         page,
+        media_cache_key: None,
     }
 }
 
@@ -1427,6 +1513,10 @@ fn truncate_html(text: &str, max: usize) -> String {
     escaped.push('…');
     escaped
 }
+fn telegram_photo_preview_cache_key(item: &MediaItem) -> String {
+    format!("{}:telegram-photo-preview-v1", item.cache_key)
+}
+
 fn telegram_cache_key(item: &MediaItem) -> String {
     if item.kind == MediaKind::Video {
         format!("{}:telegram-video-v2", item.cache_key)

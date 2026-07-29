@@ -74,6 +74,7 @@ pub struct Config {
     pub telegram_request_timeout_secs: u64,
     pub media_download_timeout_secs: u64,
     pub media_download_retries: usize,
+    pub media_photo_source_max_size_mb: u64,
     pub database_url: String,
     pub fxtwitter_api_base: String,
     pub pixiv_web_api_base: String,
@@ -115,6 +116,7 @@ impl Config {
             telegram_request_timeout_secs: parse("TELEGRAM_REQUEST_TIMEOUT_SECS", 600),
             media_download_timeout_secs: parse("MEDIA_DOWNLOAD_TIMEOUT_SECS", 120).max(1),
             media_download_retries: parse("MEDIA_DOWNLOAD_RETRIES", 3),
+            media_photo_source_max_size_mb: parse("MEDIA_PHOTO_SOURCE_MAX_SIZE_MB", 200).max(10),
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://data/feedbot.db?mode=rwc".to_string()),
             fxtwitter_api_base: env::var("FXTWITTER_API_BASE")

@@ -19,7 +19,8 @@ Telegram 多平台内容解析 Bot。把链接发给 Bot，它会提取正文、
 - 默认视频清晰度：最高不超过 480p，优先 H.264/AAC；可用 `/video 720p` 等上调。
 - Bilibili 会在下载前按码率、时长和 Telegram 上传上限自动降到 480p/360p。
 - 媒体下载支持超时配置、失败重试、HTTP Range 续传、备用 CDN。
-- 超尺寸图片按文件发送（不缩放）；超大视频会尝试 FFmpeg 压缩。
+- 超尺寸、超长宽比或超过 10MB 的图片会生成 Telegram 合规预览；回复该预览发送 `/file` 可取回对应原图。
+- 超大视频会尝试 FFmpeg 压缩。
 - 成功上传后的 Telegram `file_id` 写入 SQLite，重复发送可直接复用。
 - 较长简介使用 Telegram 可展开引用；媒体 caption 仍受 1024 字限制。
 - 专辑/歌单只展示封面和前 30 首；直播只展示信息和封面。
@@ -179,7 +180,7 @@ docker run -d --name netease-api -p 3000:3000 moefurina/ncm-api:latest
 ### 4.2 下载并运行
 
 ```bash
-VERSION=v0.2.13
+VERSION=v0.2.15
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
@@ -288,6 +289,7 @@ cargo run --release
 | `TELEGRAM_REQUEST_TIMEOUT_SECS` | 上传到 Telegram 的请求超时 | `600` |
 | `MEDIA_DOWNLOAD_TIMEOUT_SECS` | 上游媒体单次下载超时 | `120` |
 | `MEDIA_DOWNLOAD_RETRIES` | 下载失败重试次数（含 Range 续传） | `3` |
+| `MEDIA_PHOTO_SOURCE_MAX_SIZE_MB` | 生成图片预览时允许下载的源文件上限（MB） | `200` |
 | `MEDIA_SPOILER_MODE` | `auto` / `always` / `off` | `auto` |
 
 ### 平台相关
@@ -302,7 +304,7 @@ cargo run --release
 | `FXTWITTER_API_BASE` | FxTwitter API 根地址 |
 | `FFMPEG_PATH` / `FFPROBE_PATH` / `YT_DLP_PATH` | 外部工具路径 |
 | `UPLOAD_WORKERS` | 并发媒体处理数 | 默认 `4` |
-| `MAX_QUEUE_SIZE` | 排队上限 | 默认 `200` |
+| `MAX_QUEUE_SIZE` | 同时进入媒体发送流程的任务数 | 默认 `200` |
 | `REQUEST_LIMIT_COUNT` | 用户限流次数；`0` 关闭 | 默认 `0` |
 
 ### Bilibili CDN 建议
@@ -353,7 +355,8 @@ BILIBILI_CDN=ali
 - 直接发送一个或多个支持的链接
 - `/parse <url>`：显式解析
 - `/video [360p|480p|720p|1080p] <url>`：指定视频清晰度上限，默认 480p
-- `/file <url>`：按文件发送
+- `/file <url>`：按文件发送原始媒体
+- 回复 Bot 发出的某一张图片预览并发送 `/file`：只发送被回复图片对应的原图文件
 - `/cover <url>`：只发封面
 - 链接后加 `+sp`：本次强制遮罩，例如 `https://www.pixiv.net/artworks/123456 +sp`
 - Pixiv 等多图链接后加 `+pN`：只发送第 N 页，例如 `https://www.pixiv.net/artworks/123456+p2` 或 `... 123456 +p2`
@@ -381,6 +384,8 @@ BILIBILI_CDN=ali
 | 群聊不自动解析链接 | Privacy Mode 仍开启 | BotFather `/setprivacy` → Disable |
 | 网易云失败 | sidecar 未启动或地址错 | Docker 看 `netease-api`；二进制确认 `NETEASE_API_BASE` |
 | Bilibili 下载中断/超时 | CDN 或网络不稳 | 设 `BILIBILI_CDN=backupUrl` 或 `ali/cos/hw`，适当增大 `MEDIA_DOWNLOAD_TIMEOUT_SECS` |
+| 图片只显示预览 | 原图超过 Telegram Photo 限制 | 回复该张预览发送 `/file` 获取原图文件 |
+| 图片预览生成失败 | 源图超过安全下载上限或格式损坏 | 调大 `MEDIA_PHOTO_SOURCE_MAX_SIZE_MB`，并检查 FFmpeg 日志 |
 | 大视频发不出去 | 超过官方 50MB | 启用本地 Bot API，或依赖自动压缩/降清晰度 |
 | 需要登录的内容失败 | Cookie 失效 | 私聊重新 `/login bili` 或 `/login netease` |
 | YouTube 受限 | 需要登录 cookie | 配置 `YOUTUBE_COOKIES_FILE` |
@@ -399,8 +404,8 @@ cargo build --release --locked
 ## 10. 架构速览
 
 - 主程序：Rust + Tokio + Teloxide
-- 持久化：SQLite（`file_id` 缓存、扫码 Cookie、限流等）
-- 本地内存缓存：解析结果短时缓存
+- 持久化：SQLite（`file_id` 缓存、回复媒体映射、扫码 Cookie）
+- 本地内存：解析结果短时缓存与用户限流
 - 外部工具：FFmpeg / ffprobe / yt-dlp
 - 网易云：独立 sidecar，HTTP 调用
 

@@ -28,6 +28,7 @@ fn config(temp_dir: PathBuf) -> Config {
         telegram_request_timeout_secs: 600,
         media_download_timeout_secs: 120,
         media_download_retries: 3,
+        media_photo_source_max_size_mb: 200,
         database_url: "sqlite::memory:".into(),
         fxtwitter_api_base: String::new(),
         pixiv_web_api_base: String::new(),
@@ -208,7 +209,7 @@ async fn oversized_content_length_stops_without_retries() {
 }
 
 #[tokio::test]
-async fn oversized_photo_dimensions_force_document_mode() {
+async fn oversized_photo_dimensions_generate_preview_and_preserve_original_for_file_mode() {
     if Command::new("ffmpeg")
         .arg("-version")
         .output()
@@ -275,7 +276,123 @@ async fn oversized_photo_dimensions_force_document_mode() {
     let output_dir = tempfile::tempdir().unwrap();
     let processor = MediaProcessor::new(Client::new(), &config(output_dir.path().into()));
     let prepared = processor.prepare(&content, &item, 720).await.unwrap();
-    assert!(prepared.force_document);
+    assert!(prepared.is_preview);
+    assert_eq!(prepared.item.mime_type.as_deref(), Some("image/jpeg"));
+    assert!(
+        prepared
+            .item
+            .cache_key
+            .ends_with(":telegram-photo-preview-v1")
+    );
+    let preview = image::open(&prepared.path).unwrap();
+    assert!(telegram_photo_dimensions_valid(
+        preview.width(),
+        preview.height()
+    ));
+    assert_eq!(preview.height(), 2102);
+    assert!(preview.width() > 100);
+    assert!(tokio::fs::metadata(&prepared.path).await.unwrap().len() < 9 * 1024 * 1024);
+    processor.cleanup(prepared).await;
+
+    let original = processor
+        .prepare_original(&content, &item, 720)
+        .await
+        .unwrap();
+    assert!(!original.is_preview);
+    let original_image = image::open(&original.path).unwrap();
+    assert_eq!(
+        (original_image.width(), original_image.height()),
+        (100, 2102)
+    );
+    processor.cleanup(original).await;
+}
+
+#[tokio::test]
+async fn oversized_photo_source_uses_upstream_preview() {
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let thumbnail = fixture.path().join("thumbnail.jpg");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:s=64x64",
+            "-frames:v",
+            "1",
+        ])
+        .arg(&thumbnail)
+        .output()
+        .await
+        .unwrap();
+    assert!(generated.status.success());
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/original.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0_u8; 1024 * 1024 + 1]))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/thumbnail.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(tokio::fs::read(&thumbnail).await.unwrap()),
+        )
+        .mount(&server)
+        .await;
+    let item = MediaItem {
+        kind: MediaKind::Photo,
+        source_url: format!("{}/original.jpg", server.uri()),
+        fallback_urls: vec![],
+        thumbnail_url: Some(format!("{}/thumbnail.jpg", server.uri())),
+        filename: "original.jpg".into(),
+        mime_type: Some("image/jpeg".into()),
+        duration_secs: None,
+        width: None,
+        height: None,
+        size: None,
+        headers: Default::default(),
+        cache_key: "test:large-photo-source".into(),
+        requires_download: true,
+        secondary_url: None,
+        secondary_fallback_urls: vec![],
+    };
+    let content = ParsedContent {
+        platform: Platform::Pixiv,
+        kind: ContentKind::Artwork,
+        id: "large".into(),
+        canonical_url: "https://example.com/large".into(),
+        author: Author::default(),
+        title: String::new(),
+        text: String::new(),
+        sensitive: false,
+        stats: Default::default(),
+        media: vec![item.clone()],
+        collection_items: vec![],
+    };
+    let output_dir = tempfile::tempdir().unwrap();
+    let mut test_config = config(output_dir.path().into());
+    test_config.media_photo_source_max_size_mb = 1;
+    let processor = MediaProcessor::new(Client::new(), &test_config);
+    let prepared = processor.prepare(&content, &item, 720).await.unwrap();
+    assert!(prepared.is_preview);
+    assert_eq!(
+        (prepared.item.width, prepared.item.height),
+        (Some(64), Some(64))
+    );
+    assert!(
+        prepared
+            .item
+            .cache_key
+            .ends_with(":telegram-photo-preview-v1")
+    );
     processor.cleanup(prepared).await;
 }
 

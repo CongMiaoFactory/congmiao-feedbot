@@ -37,6 +37,7 @@ Desktop.ini
 # Local agent metadata
 /.agents/
 /.codex/
+/.taskman/
 
 # Upstream Python reference checkout; the Rust implementation is standalone.
 /telegram-bili-feed-helper/

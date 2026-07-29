@@ -25,6 +25,7 @@ fn config() -> Config {
         telegram_request_timeout_secs: 600,
         media_download_timeout_secs: 120,
         media_download_retries: 3,
+        media_photo_source_max_size_mb: 200,
         database_url: "sqlite::memory:".into(),
         fxtwitter_api_base: "https://api.fxtwitter.com".into(),
         pixiv_web_api_base: "https://www.pixiv.net".into(),
@@ -230,7 +231,7 @@ async fn pixiv_provider_supports_multiple_pages() {
     Mock::given(method("GET")).and(path("/ajax/illust/123")).and(query_param("lang", "zh"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":{"title":"work","userId":"5","userName":"Artist","pageCount":2,"xRestrict":1,"tags":{"tags":[{"name":"R-18"},{"tag":"插画"}]}}}))).mount(&server).await;
     Mock::given(method("GET")).and(path("/ajax/illust/123/pages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":[{"urls":{"original":"https://i.pximg.net/1.jpg"}},{"urls":{"original":"https://i.pximg.net/2.jpg"}}]}))).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":[{"urls":{"original":"https://i.pximg.net/1.jpg","regular":"https://i.pximg.net/1-regular.jpg"}},{"urls":{"original":"https://i.pximg.net/2.jpg","regular":"https://i.pximg.net/2-regular.jpg"}}]}))).mount(&server).await;
     let mut c = config();
     c.pixiv_web_api_base = server.uri();
     let parsed = PixivProvider::new(Client::new(), &c)
@@ -257,7 +258,33 @@ async fn pixiv_provider_supports_multiple_pages() {
     .unwrap();
     assert_eq!(page2.len(), 1);
     assert_eq!(page2[0].source_url, "https://i.pximg.net/2.jpg");
+    assert_eq!(
+        page2[0].thumbnail_url.as_deref(),
+        Some("https://i.pximg.net/2-regular.jpg")
+    );
     assert!(page2[0].cache_key.ends_with(":p1"));
+
+    let replied_page = select_media_items(
+        &parsed,
+        &ParseOptions {
+            file_mode: true,
+            media_cache_key: Some(page2[0].cache_key.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(replied_page.len(), 1);
+    assert_eq!(replied_page[0].source_url, "https://i.pximg.net/2.jpg");
+    let missing_reply = select_media_items(
+        &parsed,
+        &ParseOptions {
+            file_mode: true,
+            media_cache_key: Some("pixiv:123:missing".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(missing_reply.to_string().contains("已不存在"));
 
     let err = select_media_items(
         &parsed,
@@ -559,6 +586,24 @@ async fn sqlite_cache_and_local_rate_limit_work() {
             .as_deref(),
         Some("file")
     );
+    storage
+        .put_message_media(
+            -100123,
+            42,
+            "https://www.pixiv.net/artworks/123",
+            "pixiv:123:p1",
+            Some(720),
+        )
+        .await
+        .unwrap();
+    let target = storage
+        .get_message_media(-100123, 42)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.canonical_url, "https://www.pixiv.net/artworks/123");
+    assert_eq!(target.media_cache_key, "pixiv:123:p1");
+    assert_eq!(target.quality, Some(720));
     let cache = AppCache::new();
     assert!(cache.allow("u", 2, Duration::from_secs(60)).await);
     assert!(cache.allow("u", 2, Duration::from_secs(60)).await);

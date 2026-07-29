@@ -31,6 +31,11 @@ use crate::{
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+const TELEGRAM_PHOTO_MAX_SIZE: u64 = 10 * 1024 * 1024;
+const TELEGRAM_PHOTO_PREVIEW_TARGET_SIZE: u64 = 9 * 1024 * 1024;
+const TELEGRAM_PHOTO_PREVIEW_MAX_EDGE: u32 = 4096;
+const TELEGRAM_PHOTO_PREVIEW_MAX_RATIO: u32 = 19;
+
 #[derive(Debug)]
 struct MediaTooLarge {
     max_size: u64,
@@ -60,7 +65,7 @@ pub fn is_permanent_prepare_error(error: &anyhow::Error) -> bool {
 pub struct PreparedMedia {
     pub item: MediaItem,
     pub path: PathBuf,
-    pub force_document: bool,
+    pub is_preview: bool,
 }
 
 #[derive(Debug, Default)]
@@ -108,6 +113,7 @@ pub struct MediaProcessor {
     temp_dir: PathBuf,
     semaphore: Arc<Semaphore>,
     max_size: u64,
+    photo_source_max_size: u64,
     download_retries: usize,
 }
 
@@ -126,6 +132,9 @@ impl MediaProcessor {
             } else {
                 50 * 1024 * 1024
             },
+            photo_source_max_size: config
+                .media_photo_source_max_size_mb
+                .saturating_mul(1024 * 1024),
             download_retries: config.media_download_retries,
         }
     }
@@ -222,6 +231,27 @@ impl MediaProcessor {
         item: &MediaItem,
         quality: u32,
     ) -> Result<PreparedMedia> {
+        self.prepare_with_photo_mode(content, item, quality, false)
+            .await
+    }
+
+    pub async fn prepare_original(
+        &self,
+        content: &ParsedContent,
+        item: &MediaItem,
+        quality: u32,
+    ) -> Result<PreparedMedia> {
+        self.prepare_with_photo_mode(content, item, quality, true)
+            .await
+    }
+
+    async fn prepare_with_photo_mode(
+        &self,
+        content: &ParsedContent,
+        item: &MediaItem,
+        quality: u32,
+        preserve_photo_original: bool,
+    ) -> Result<PreparedMedia> {
         let _permit = self.semaphore.acquire().await?;
         tokio::fs::create_dir_all(&self.temp_dir).await?;
         let safe = unique_temp_key(&item.cache_key);
@@ -229,11 +259,19 @@ impl MediaProcessor {
             .temp_dir
             .join(format!("{safe}-{}", sanitize(&item.filename)));
         let prepared = self
-            .prepare_into(content, item, quality, &safe, &output)
+            .prepare_into(
+                content,
+                item,
+                quality,
+                &safe,
+                &output,
+                preserve_photo_original,
+            )
             .await;
         if prepared.is_err() {
             // 下载或转码失败时不留半成品，temp 目录不随错误累积垃圾。
             let _ = tokio::fs::remove_file(&output).await;
+            let _ = tokio::fs::remove_file(output.with_extension("telegram-preview.jpg")).await;
         }
         prepared
     }
@@ -245,12 +283,14 @@ impl MediaProcessor {
         quality: u32,
         safe: &str,
         output: &Path,
+        preserve_photo_original: bool,
     ) -> Result<PreparedMedia> {
-        let download_limit = if matches!(item.kind, MediaKind::Video | MediaKind::Animation) {
-            2_000_000_000
-        } else {
-            self.max_size
+        let download_limit = match item.kind {
+            MediaKind::Video | MediaKind::Animation => 2_000_000_000,
+            MediaKind::Photo if !preserve_photo_original => self.photo_source_max_size,
+            _ => self.max_size,
         };
+        let mut used_photo_thumbnail = false;
         if item.kind == MediaKind::Animation
             && item
                 .secondary_url
@@ -280,14 +320,41 @@ impl MediaProcessor {
                 .await?;
         } else {
             let primary = self.temp_dir.join(format!("{safe}.part1"));
-            self.download_with_fallbacks(
-                &item.source_url,
-                &item.fallback_urls,
-                &primary,
-                &item.headers,
-                download_limit,
-            )
-            .await?;
+            let primary_download = self
+                .download_with_fallbacks(
+                    &item.source_url,
+                    &item.fallback_urls,
+                    &primary,
+                    &item.headers,
+                    download_limit,
+                )
+                .await;
+            if let Err(error) = primary_download {
+                let can_use_thumbnail = item.kind == MediaKind::Photo
+                    && !preserve_photo_original
+                    && is_permanent_prepare_error(&error)
+                    && item
+                        .thumbnail_url
+                        .as_deref()
+                        .is_some_and(|url| url != item.source_url);
+                if can_use_thumbnail {
+                    let thumbnail_url = item.thumbnail_url.as_deref().expect("checked above");
+                    warn!(
+                        error = %error,
+                        "原图超过预览下载上限，改用上游预览图"
+                    );
+                    self.download(
+                        thumbnail_url,
+                        &primary,
+                        &item.headers,
+                        self.max_size.min(self.photo_source_max_size),
+                    )
+                    .await?;
+                    used_photo_thumbnail = true;
+                } else {
+                    return Err(error);
+                }
+            }
             if let Some(second_url) = &item.secondary_url {
                 let secondary = self.temp_dir.join(format!("{safe}.part2"));
                 let preparation = async {
@@ -311,6 +378,8 @@ impl MediaProcessor {
             }
         }
         let mut prepared_item = item.clone();
+        let mut prepared_path = output.to_path_buf();
+        let mut is_preview = false;
         let mut video_metadata = if item.kind == MediaKind::Video {
             let mut metadata = self.probe_video(output).await?;
             if !video_is_telegram_compatible(&metadata) {
@@ -321,32 +390,57 @@ impl MediaProcessor {
         } else {
             None
         };
-        let force_document = if item.kind == MediaKind::Photo {
-            let path = output.to_path_buf();
-            tokio::task::spawn_blocking(move || photo_exceeds_telegram_dimensions(&path))
-                .await?
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        let item_limit =
-            if item.kind == MediaKind::Photo && !force_document && self.max_size < 2_000_000_000 {
-                10 * 1024 * 1024
+        if item.kind == MediaKind::Photo && !preserve_photo_original {
+            let (width, height) = photo_dimensions(output)?;
+            let source_size = tokio::fs::metadata(output).await?.len();
+            if source_size > TELEGRAM_PHOTO_MAX_SIZE
+                || !telegram_photo_dimensions_valid(width, height)
+            {
+                let (preview_path, preview_width, preview_height) =
+                    self.render_photo_preview(output, width, height).await?;
+                prepared_path = preview_path;
+                prepared_item.width = Some(preview_width);
+                prepared_item.height = Some(preview_height);
+                prepared_item.filename = preview_filename(&item.filename);
+                prepared_item.mime_type = Some("image/jpeg".into());
+                prepared_item.cache_key = format!("{}:telegram-photo-preview-v1", item.cache_key);
+                is_preview = true;
             } else {
-                self.max_size
-            };
-        if tokio::fs::metadata(output).await?.len() > item_limit
-            && matches!(item.kind, MediaKind::Video | MediaKind::Animation)
-        {
-            self.compress_video(output).await?;
-            if item.kind == MediaKind::Video {
-                video_metadata = Some(self.probe_video(output).await?);
+                prepared_item.width = Some(width);
+                prepared_item.height = Some(height);
+                if used_photo_thumbnail {
+                    prepared_item.cache_key =
+                        format!("{}:telegram-photo-preview-v1", item.cache_key);
+                    is_preview = true;
+                }
+            }
+            let (final_width, final_height) = photo_dimensions(&prepared_path)?;
+            let final_size = tokio::fs::metadata(&prepared_path).await?.len();
+            if final_size > TELEGRAM_PHOTO_MAX_SIZE
+                || !telegram_photo_dimensions_valid(final_width, final_height)
+            {
+                bail!(
+                    "图片预览仍不符合 Telegram 限制：{}x{}，{}MB",
+                    final_width,
+                    final_height,
+                    final_size / 1024 / 1024
+                );
             }
         }
-        if tokio::fs::metadata(output).await?.len() > item_limit && item.kind == MediaKind::Photo {
-            self.compress_image(output).await?;
+        let item_limit = if item.kind == MediaKind::Photo && !preserve_photo_original {
+            TELEGRAM_PHOTO_MAX_SIZE
+        } else {
+            self.max_size
+        };
+        if tokio::fs::metadata(&prepared_path).await?.len() > item_limit
+            && matches!(item.kind, MediaKind::Video | MediaKind::Animation)
+        {
+            self.compress_video(&prepared_path).await?;
+            if item.kind == MediaKind::Video {
+                video_metadata = Some(self.probe_video(&prepared_path).await?);
+            }
         }
-        let size = tokio::fs::metadata(output).await?.len();
+        let size = tokio::fs::metadata(&prepared_path).await?.len();
         if size > item_limit {
             bail!("媒体文件 {} MB 超过 Telegram 限制", size / 1024 / 1024);
         }
@@ -357,8 +451,8 @@ impl MediaProcessor {
         }
         Ok(PreparedMedia {
             item: prepared_item,
-            path: output.to_path_buf(),
-            force_document,
+            path: prepared_path,
+            is_preview,
         })
     }
 
@@ -702,25 +796,67 @@ impl MediaProcessor {
         tokio::fs::rename(compressed, path).await?;
         Ok(())
     }
-    async fn compress_image(&self, path: &Path) -> Result<()> {
-        let compressed = path.with_extension("compressed.jpg");
-        let out = Command::new(&self.ffmpeg)
-            .arg("-y")
-            .arg("-i")
-            .arg(path)
-            .args(["-vf", "scale='min(4096,iw)':-2", "-q:v", "4"])
-            .arg(&compressed)
-            .output()
-            .await?;
-        if !out.status.success() {
-            bail!(
-                "FFmpeg 图片压缩失败: {}",
-                String::from_utf8_lossy(&out.stderr)
+    async fn render_photo_preview(
+        &self,
+        path: &Path,
+        width: u32,
+        height: u32,
+    ) -> Result<(PathBuf, u32, u32)> {
+        let preview = path.with_extension("telegram-preview.jpg");
+        let attempts = [
+            (TELEGRAM_PHOTO_PREVIEW_MAX_EDGE, 3_u8),
+            (3072_u32, 5_u8),
+            (2048_u32, 7_u8),
+        ];
+        let mut last_error = None;
+        for (max_edge, quality) in attempts {
+            let (scaled_width, scaled_height, canvas_width, canvas_height) =
+                photo_preview_dimensions(width, height, max_edge)?;
+            let filter = format!(
+                "scale={scaled_width}:{scaled_height}:flags=lanczos,pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2:black"
             );
+            let output = Command::new(&self.ffmpeg)
+                .arg("-y")
+                .arg("-i")
+                .arg(path)
+                .args([
+                    "-map_metadata",
+                    "-1",
+                    "-vf",
+                    &filter,
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                ])
+                .arg(quality.to_string())
+                .arg(&preview)
+                .output()
+                .await
+                .context("无法启动 FFmpeg 生成图片预览")?;
+            if !output.status.success() {
+                last_error = Some(anyhow!(
+                    "FFmpeg 图片预览失败: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+                continue;
+            }
+            let size = tokio::fs::metadata(&preview).await?.len();
+            let (actual_width, actual_height) = photo_dimensions(&preview)?;
+            if size <= TELEGRAM_PHOTO_PREVIEW_TARGET_SIZE
+                && telegram_photo_dimensions_valid(actual_width, actual_height)
+            {
+                tokio::fs::remove_file(path).await?;
+                return Ok((preview, actual_width, actual_height));
+            }
+            last_error = Some(anyhow!(
+                "图片预览输出仍超限：{}x{}，{}MB",
+                actual_width,
+                actual_height,
+                size / 1024 / 1024
+            ));
         }
-        tokio::fs::remove_file(path).await?;
-        tokio::fs::rename(compressed, path).await?;
-        Ok(())
+        let _ = tokio::fs::remove_file(&preview).await;
+        Err(last_error.unwrap_or_else(|| anyhow!("无法生成 Telegram 图片预览")))
     }
     async fn convert_ugoira(&self, archive: &Path, metadata: &str, output: &Path) -> Result<()> {
         let frames: serde_json::Value =
@@ -827,18 +963,57 @@ fn video_is_telegram_compatible(metadata: &VideoMetadata) -> bool {
         && metadata.duration_secs.is_some_and(|duration| duration > 0)
 }
 
+fn photo_dimensions(path: &Path) -> Result<(u32, u32)> {
+    Ok(image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_dimensions()?)
+}
+
+fn photo_preview_dimensions(
+    width: u32,
+    height: u32,
+    max_edge: u32,
+) -> Result<(u32, u32, u32, u32)> {
+    if width == 0 || height == 0 || max_edge == 0 {
+        bail!("图片尺寸无效：{width}x{height}");
+    }
+    let longest = width.max(height);
+    let (scaled_width, scaled_height) = if longest > max_edge {
+        let scaled_width =
+            (u64::from(width) * u64::from(max_edge) / u64::from(longest)).max(1) as u32;
+        let scaled_height =
+            (u64::from(height) * u64::from(max_edge) / u64::from(longest)).max(1) as u32;
+        (scaled_width, scaled_height)
+    } else {
+        (width, height)
+    };
+    let mut canvas_width = scaled_width;
+    let mut canvas_height = scaled_height;
+    if u64::from(scaled_height) > u64::from(scaled_width) * TELEGRAM_PHOTO_PREVIEW_MAX_RATIO as u64
+    {
+        canvas_width = scaled_height.div_ceil(TELEGRAM_PHOTO_PREVIEW_MAX_RATIO);
+    } else if u64::from(scaled_width)
+        > u64::from(scaled_height) * TELEGRAM_PHOTO_PREVIEW_MAX_RATIO as u64
+    {
+        canvas_height = scaled_width.div_ceil(TELEGRAM_PHOTO_PREVIEW_MAX_RATIO);
+    }
+    Ok((scaled_width, scaled_height, canvas_width, canvas_height))
+}
+
+fn preview_filename(filename: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("photo");
+    format!("{stem}-preview.jpg")
+}
+
 pub fn telegram_photo_dimensions_valid(width: u32, height: u32) -> bool {
     width > 0
         && height > 0
         && u64::from(width) + u64::from(height) <= 10_000
         && u64::from(width.max(height)) <= u64::from(width.min(height)) * 20
-}
-
-fn photo_exceeds_telegram_dimensions(path: &Path) -> Result<bool> {
-    let (width, height) = image::ImageReader::open(path)?
-        .with_guessed_format()?
-        .into_dimensions()?;
-    Ok(!telegram_photo_dimensions_valid(width, height))
 }
 
 fn content_range_start(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {

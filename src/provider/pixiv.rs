@@ -158,22 +158,34 @@ impl Provider for PixivProvider {
             .or_else(|| get_str(body, "/userId"))
             .or_else(|| get_str(body, "/user/id"))
             .unwrap_or_default();
-        let mut urls: Vec<String> = Vec::new();
+        let mut urls: Vec<(String, Option<String>)> = Vec::new();
         for pointer in ["/images", "/urls", "/imageUrls"] {
             if let Some(array) = body.pointer(pointer).and_then(Value::as_array) {
-                urls.extend(array.iter().filter_map(|v| {
-                    v.as_str()
-                        .or_else(|| v.get("original").and_then(Value::as_str))
-                        .or_else(|| v.get("url").and_then(Value::as_str))
-                        .map(str::to_string)
+                urls.extend(array.iter().filter_map(|value| {
+                    let original = value
+                        .as_str()
+                        .or_else(|| value.get("original").and_then(Value::as_str))
+                        .or_else(|| value.get("url").and_then(Value::as_str))?;
+                    let thumbnail = value
+                        .get("regular")
+                        .or_else(|| value.get("large"))
+                        .or_else(|| value.get("medium"))
+                        .and_then(Value::as_str)
+                        .filter(|url| *url != original)
+                        .map(str::to_string);
+                    Some((original.to_string(), thumbnail))
                 }));
             }
         }
         if let Some(pages) = body.pointer("/meta_pages").and_then(Value::as_array) {
-            urls.extend(pages.iter().filter_map(|p| {
-                get_str(p, "/image_urls/original")
-                    .or_else(|| get_str(p, "/image_urls/large"))
-                    .map(str::to_string)
+            urls.extend(pages.iter().filter_map(|page| {
+                let original = get_str(page, "/image_urls/original")
+                    .or_else(|| get_str(page, "/image_urls/large"))?;
+                let thumbnail = get_str(page, "/image_urls/large")
+                    .or_else(|| get_str(page, "/image_urls/medium"))
+                    .filter(|url| *url != original)
+                    .map(str::to_string);
+                Some((original.to_string(), thumbnail))
             }));
         }
         if app.is_none() && get_u64(body, "/pageCount").unwrap_or(1) > 1 {
@@ -188,11 +200,14 @@ impl Provider for PixivProvider {
             let pages = json_response(response, "Pixiv Pages API").await?;
             urls.clear();
             if let Some(items) = pages.pointer("/body").and_then(Value::as_array) {
-                urls.extend(
-                    items
-                        .iter()
-                        .filter_map(|page| get_str(page, "/urls/original").map(str::to_string)),
-                );
+                urls.extend(items.iter().filter_map(|page| {
+                    let original = get_str(page, "/urls/original")?;
+                    let thumbnail = get_str(page, "/urls/regular")
+                        .or_else(|| get_str(page, "/urls/small"))
+                        .filter(|url| *url != original)
+                        .map(str::to_string);
+                    Some((original.to_string(), thumbnail))
+                }));
             }
         }
         if urls.is_empty()
@@ -202,7 +217,11 @@ impl Provider for PixivProvider {
                 .or_else(|| get_str(body, "/meta_single_page/original_image_url"))
                 .or_else(|| get_str(body, "/image_urls/large"))
         {
-            urls.push(url.to_string());
+            let thumbnail = get_str(body, "/urls/regular")
+                .or_else(|| get_str(body, "/image_urls/large"))
+                .filter(|thumbnail| *thumbnail != url)
+                .map(str::to_string);
+            urls.push((url.to_string(), thumbnail));
         }
         let canonical = format!("https://www.pixiv.net/artworks/{id}");
         let mut media = Vec::new();
@@ -255,7 +274,7 @@ impl Provider for PixivProvider {
                 secondary_fallback_urls: vec![],
             });
         }
-        for (index, url) in urls.into_iter().enumerate() {
+        for (index, (url, thumbnail_url)) in urls.into_iter().enumerate() {
             if !media.is_empty() && is_ugoira {
                 break;
             }
@@ -265,7 +284,7 @@ impl Provider for PixivProvider {
                 kind: MediaKind::Photo,
                 source_url: url.clone(),
                 fallback_urls: vec![],
-                thumbnail_url: None,
+                thumbnail_url,
                 filename: filename_from_url(&url, &format!("pixiv-{id}-p{index}.jpg")),
                 mime_type: None,
                 duration_secs: None,
