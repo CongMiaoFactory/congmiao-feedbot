@@ -124,7 +124,7 @@ pub(crate) async fn json_response(
     if status.as_u16() == 404 {
         return Err(ProviderError::Unavailable(source.to_string()));
     }
-    if status.as_u16() == 429 {
+    if status.as_u16() == 429 || status.as_u16() == 412 {
         return Err(ProviderError::RateLimited(source.to_string()));
     }
     if !status.is_success() {

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::OnceLock,
+};
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -9,6 +12,18 @@ use crate::{BilibiliCdnPreference, Config, RuntimeCredentials, model::*};
 
 use super::{Provider, filename_from_url, get_str, get_u64, json_response};
 
+#[derive(Debug, Clone)]
+enum BilibiliTarget {
+    Video(String),
+    Bangumi(String),
+    Dynamic(String),
+    Live(String),
+    Audio(String),
+    Article(String),
+}
+
+const OPUS_FEATURES: &str = "itemOpusStyle,opusBigCover,onlyfansVote,endFooterHidden,decorationCard,onlyfansAssetsV2,ugcDelete,onlyfansQaCard,commentsNewVersion";
+
 pub struct BilibiliProvider {
     client: Client,
     credentials: RuntimeCredentials,
@@ -17,7 +32,6 @@ pub struct BilibiliProvider {
     www_base: String,
     max_media_size: u64,
     cdn: BilibiliCdnPreference,
-    matcher: Regex,
     bvid: Regex,
 }
 
@@ -43,10 +57,6 @@ impl BilibiliProvider {
                 50 * 1024 * 1024
             },
             cdn: config.bilibili_cdn,
-            matcher: Regex::new(
-                r"(?i)(?:bilibili\.com|b23\.tv|(?:^|\s)BV[0-9A-Za-z]{10}|(?:^|\s)av\d{2,}(?:\?|$))",
-            )
-            .expect("valid Bilibili matcher"),
             bvid: Regex::new(r"(?i)(BV[0-9A-Za-z]{10})").expect("valid BV regex"),
         }
     }
@@ -66,42 +76,121 @@ impl BilibiliProvider {
             "Bilibili API",
         )
         .await?;
-        if value
+        let code = value
             .get("code")
             .and_then(Value::as_i64)
-            .unwrap_or_default()
-            != 0
-        {
-            return Err(ProviderError::Upstream(format!(
-                "Bilibili: {}",
-                get_str(&value, "/message").unwrap_or("未知错误")
-            )));
+            .unwrap_or_default();
+        if code != 0 {
+            let message = get_str(&value, "/message").unwrap_or("未知错误");
+            return Err(match code {
+                -101 => ProviderError::Authentication(format!("Bilibili: {message}")),
+                -352 | 412 => ProviderError::RateLimited(format!("Bilibili: {message}")),
+                404 | 4101139 => ProviderError::Unavailable(format!("Bilibili: {message}")),
+                _ => ProviderError::Upstream(format!("Bilibili: {message}")),
+            });
         }
         Ok(value)
     }
     async fn resolve(&self, raw: &str) -> ProviderResult<String> {
-        if let Some(c) = self.bvid.captures(raw) {
-            return Ok(format!("https://www.bilibili.com/video/{}", &c[1]));
+        if let Some(c) = bare_bvid_regex().captures(raw.trim()) {
+            return Ok(format!("https://www.bilibili.com/video/{}", &c[0]));
         }
-        // 裸 av 号没有域名，不能走 HEAD 重定向，直接拼出标准视频地址。
-        if let Some(c) = Regex::new(r"(?i)^av(\d{2,})(?:\?|$)")
-            .expect("valid bare av regex")
-            .captures(raw)
-        {
+        if let Some(c) = bare_av_regex().captures(raw.trim()) {
             return Ok(format!("https://www.bilibili.com/video/av{}", &c[1]));
         }
-        let url = if raw.starts_with("http") {
+        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
             raw.to_string()
         } else {
             format!("https://{raw}")
         };
+        let parsed = url::Url::parse(&url).map_err(|_| ProviderError::InvalidUrl(raw.into()))?;
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        if is_bilibili_host(&host) && host != "b23.tv" {
+            return Ok(parsed.to_string());
+        }
+        if host != "b23.tv" {
+            return Err(ProviderError::InvalidUrl(raw.into()));
+        }
         let response = self
             .client
             .head(&url)
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        Ok(response.url().to_string())
+        let resolved = response.url().clone();
+        let resolved_host = resolved.host_str().unwrap_or_default().to_ascii_lowercase();
+        if !is_bilibili_host(&resolved_host) || resolved_host == "b23.tv" {
+            return Err(ProviderError::InvalidUrl(raw.into()));
+        }
+        Ok(resolved.to_string())
+    }
+
+    fn target(&self, url: &str) -> ProviderResult<BilibiliTarget> {
+        let parsed = url::Url::parse(url).map_err(|_| ProviderError::InvalidUrl(url.into()))?;
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let segments: Vec<_> = parsed.path_segments().into_iter().flatten().collect();
+        if host == "live.bilibili.com" {
+            let room = segments
+                .iter()
+                .find(|segment| segment.chars().all(|c| c.is_ascii_digit()));
+            return room
+                .map(|room| BilibiliTarget::Live((*room).to_string()))
+                .ok_or_else(|| ProviderError::InvalidUrl(url.into()));
+        }
+        if host == "t.bilibili.com" {
+            return segments
+                .first()
+                .filter(|id| id.chars().all(|c| c.is_ascii_digit()))
+                .map(|id| BilibiliTarget::Dynamic((*id).to_string()))
+                .ok_or_else(|| ProviderError::InvalidUrl(url.into()));
+        }
+        for (index, segment) in segments.iter().enumerate() {
+            let next = segments.get(index + 1).copied();
+            match segment.to_ascii_lowercase().as_str() {
+                "opus" | "dynamic"
+                    if next.is_some_and(|id| id.chars().all(|c| c.is_ascii_digit())) =>
+                {
+                    return Ok(BilibiliTarget::Dynamic(next.unwrap().to_string()));
+                }
+                "video"
+                    if next.is_some_and(|id| {
+                        self.bvid.is_match(id) || av_path_regex().is_match(id)
+                    }) =>
+                {
+                    return Ok(BilibiliTarget::Video(next.unwrap().to_string()));
+                }
+                "play" if next.is_some_and(|id| ep_path_regex().is_match(id)) => {
+                    return Ok(BilibiliTarget::Bangumi(next.unwrap().to_string()));
+                }
+                "audio" if next.is_some_and(|id| audio_path_regex().is_match(id)) => {
+                    return Ok(BilibiliTarget::Audio(next.unwrap().to_string()));
+                }
+                "read"
+                    if next == Some("mobile")
+                        && segments
+                            .get(index + 2)
+                            .is_some_and(|id| id.chars().all(|c| c.is_ascii_digit())) =>
+                {
+                    return Ok(BilibiliTarget::Article(format!(
+                        "mobile/{}",
+                        segments[index + 2]
+                    )));
+                }
+                "read" if next == Some("mobile") => {
+                    let id = parsed
+                        .query_pairs()
+                        .find(|(name, _)| name == "id")
+                        .map(|(_, value)| value.into_owned())
+                        .ok_or_else(|| ProviderError::InvalidUrl(url.into()))?;
+                    return Ok(BilibiliTarget::Article(format!("mobile?id={id}")));
+                }
+                "read" if next.is_some_and(|id| article_path_regex().is_match(id)) => {
+                    return Ok(BilibiliTarget::Article(next.unwrap().to_string()));
+                }
+                _ => {}
+            }
+        }
+        Err(ProviderError::Unsupported(url.into()))
     }
     async fn headers(&self) -> BTreeMap<String, String> {
         let mut headers = BTreeMap::from([("Referer".into(), "https://www.bilibili.com/".into())]);
@@ -420,83 +509,222 @@ impl BilibiliProvider {
             collection_items: Vec::new(),
         })
     }
-    async fn parse_dynamic(&self, url: &str) -> ProviderResult<ParsedContent> {
-        let id = Regex::new(r"(?:(?:opus|dynamic)/|t\.bilibili\.com/)(\d+)")
-            .expect("valid dynamic regex")
-            .captures(url)
-            .map(|c| c[1].to_string())
-            .ok_or_else(|| ProviderError::InvalidUrl(url.into()))?;
+    async fn parse_dynamic(
+        &self,
+        url: &str,
+        id: &str,
+        options: &ParseOptions,
+    ) -> ProviderResult<ParsedContent> {
         let root = self
             .response(
                 &format!("{}/x/polymer/web-dynamic/v1/detail", self.api_base),
-                &[("id", &id)],
+                &[("id", id), ("features", OPUS_FEATURES)],
             )
             .await?;
-        let item = root.pointer("/data/item").unwrap_or(&Value::Null);
-        let author = item
-            .pointer("/modules/module_author")
-            .unwrap_or(&Value::Null);
-        let dynamic = item
+        let item = root
+            .pointer("/data/item")
+            .filter(|value| !value.is_null())
+            .ok_or_else(|| ProviderError::Unavailable(url.into()))?;
+        let outer_dynamic = item
             .pointer("/modules/module_dynamic")
             .unwrap_or(&Value::Null);
-        let mut media = Vec::new();
-        if let Some(items) = dynamic
-            .pointer("/major/opus/pics")
-            .or_else(|| dynamic.pointer("/major/draw/items"))
-            .and_then(Value::as_array)
+        let outer_text = dynamic_text(outer_dynamic);
+        let is_forward = get_str(item, "/type") == Some("DYNAMIC_TYPE_FORWARD")
+            || item.get("orig").is_some_and(|value| !value.is_null());
+        let source_item = item
+            .get("orig")
+            .filter(|value| !value.is_null())
+            .unwrap_or(item);
+        let source_dynamic = source_item
+            .pointer("/modules/module_dynamic")
+            .unwrap_or(&Value::Null);
+        let source_major = source_dynamic.pointer("/major").unwrap_or(&Value::Null);
+        let source_id = get_str(source_item, "/id_str")
+            .or_else(|| get_str(source_item, "/basic/dyn_id_str"))
+            .unwrap_or(id);
+        let source_major_type = get_str(source_major, "/type").unwrap_or_default();
+        let headers = self.headers().await;
+        let mut title = major_title(source_major);
+        let mut text = dynamic_text(source_dynamic);
+        let mut pictures = pictures_from_dynamic(source_dynamic);
+
+        if source_major_type == "MAJOR_TYPE_OPUS"
+            && let Ok(projection) = self.parse_opus_detail(source_id).await
         {
-            for (i, p) in items.iter().enumerate() {
-                if let Some(u) = get_str(p, "/url").or_else(|| get_str(p, "/src")) {
-                    media.push(MediaItem {
-                        kind: MediaKind::Photo,
-                        source_url: u.into(),
-                        fallback_urls: vec![],
-                        thumbnail_url: None,
-                        filename: filename_from_url(u, &format!("bilibili-opus-{id}-{i}.jpg")),
-                        mime_type: None,
-                        duration_secs: None,
-                        width: get_u64(p, "/width").map(|n| n as u32),
-                        height: get_u64(p, "/height").map(|n| n as u32),
-                        size: None,
-                        headers: self.headers().await,
-                        cache_key: format!("bilibili:opus:{id}:{i}"),
-                        requires_download: false,
-                        secondary_url: None,
-                        secondary_fallback_urls: vec![],
-                    });
-                }
+            if !projection.title.is_empty() {
+                title = projection.title;
+            }
+            if !projection.text.is_empty() {
+                text = projection.text;
+            }
+            if !projection.pictures.is_empty() {
+                pictures = projection.pictures;
             }
         }
+
+        let mut media = media_from_pictures(source_id, pictures, &headers);
+        if let Some(target_url) = embedded_url(source_major)
+            && let Ok(target) = self.target(&target_url)
+        {
+            let embedded = match target {
+                BilibiliTarget::Video(video) => {
+                    self.parse_video(&format!("https://www.bilibili.com/video/{video}"), options)
+                        .await
+                }
+                BilibiliTarget::Bangumi(episode) => {
+                    self.parse_video(
+                        &format!("https://www.bilibili.com/bangumi/play/{episode}"),
+                        options,
+                    )
+                    .await
+                }
+                BilibiliTarget::Live(room) => {
+                    self.parse_live(&format!("https://live.bilibili.com/{room}"))
+                        .await
+                }
+                BilibiliTarget::Audio(audio) => {
+                    self.parse_audio(&format!("https://www.bilibili.com/audio/{audio}"))
+                        .await
+                }
+                BilibiliTarget::Article(article) => {
+                    self.parse_article(&format!("https://www.bilibili.com/read/{article}"))
+                        .await
+                }
+                BilibiliTarget::Dynamic(_) => Err(ProviderError::Unsupported(target_url)),
+            };
+            if let Ok(embedded) = embedded {
+                if title.is_empty() {
+                    title = embedded.title;
+                }
+                media.extend(embedded.media);
+            }
+        }
+        if media.is_empty()
+            && let Some(cover) = major_cover(source_major)
+        {
+            media.push(photo_media(source_id, 0, &cover, None, None, &headers));
+        }
+
+        if is_forward {
+            let origin_author = author_from_item(source_item);
+            let origin = if text.is_empty() {
+                "原动态已删除或不可见".to_string()
+            } else if origin_author.name.is_empty() {
+                text.clone()
+            } else {
+                format!("转发自 {}：\n{}", origin_author.name, text)
+            };
+            text = if outer_text.is_empty() {
+                origin
+            } else {
+                format!("{outer_text}\n\n{origin}")
+            };
+        }
+
         Ok(ParsedContent {
             platform: Platform::Bilibili,
             kind: ContentKind::Post,
-            id: id.clone(),
+            id: id.to_string(),
             canonical_url: format!("https://www.bilibili.com/opus/{id}"),
-            author: Author {
-                id: get_u64(author, "/mid")
-                    .map(|n| n.to_string())
-                    .unwrap_or_default(),
-                name: get_str(author, "/name").unwrap_or_default().into(),
-                url: get_u64(author, "/mid").map(|n| format!("https://space.bilibili.com/{n}")),
-                avatar_url: get_str(author, "/face").map(str::to_string),
-            },
-            title: get_str(dynamic, "/major/opus/title")
-                .unwrap_or_default()
-                .into(),
-            text: get_str(dynamic, "/desc/text")
-                .or_else(|| get_str(dynamic, "/major/opus/summary/text"))
-                .unwrap_or_default()
-                .into(),
+            author: author_from_item(item),
+            title,
+            text,
             sensitive: false,
-            stats: Stats {
-                likes: get_u64(item, "/modules/module_stat/like/count"),
-                reposts: get_u64(item, "/modules/module_stat/forward/count"),
-                replies: get_u64(item, "/modules/module_stat/comment/count"),
-                views: None,
-            },
+            stats: stats_from_item(item),
             media,
             collection_items: Vec::new(),
         })
+    }
+
+    async fn parse_opus_detail(&self, id: &str) -> ProviderResult<OpusProjection> {
+        self.ensure_buvid3().await;
+        let root = self
+            .response(
+                &format!("{}/x/polymer/web-dynamic/v1/opus/detail", self.api_base),
+                &[
+                    ("id", id),
+                    ("features", OPUS_FEATURES),
+                    ("timezone_offset", "-480"),
+                ],
+            )
+            .await?;
+        let item = root
+            .pointer("/data/item")
+            .ok_or_else(|| ProviderError::InvalidResponse("Opus 详情缺少 item".into()))?;
+        let modules = item
+            .get("modules")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ProviderError::InvalidResponse("Opus 详情缺少 modules".into()))?;
+        let mut title = get_str(item, "/basic/title")
+            .unwrap_or_default()
+            .to_string();
+        let mut paragraphs = Vec::new();
+        let mut pictures = Vec::new();
+        for module in modules {
+            if title.is_empty() {
+                title = get_str(module, "/module_title/text")
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            let Some(content) = module.get("module_content") else {
+                continue;
+            };
+            if let Some(items) = content.pointer("/paragraphs").and_then(Value::as_array) {
+                for paragraph in items {
+                    let line = opus_paragraph_text(paragraph);
+                    if !line.is_empty() {
+                        paragraphs.push(line);
+                    }
+                    if let Some(items) = paragraph.pointer("/pic/pics").and_then(Value::as_array) {
+                        pictures.extend(items.iter().filter_map(dynamic_picture));
+                    }
+                }
+            }
+        }
+        Ok(OpusProjection {
+            title,
+            text: paragraphs.join("\n\n"),
+            pictures,
+        })
+    }
+
+    async fn ensure_buvid3(&self) {
+        let current = self.credentials.bilibili().await;
+        if current
+            .as_deref()
+            .is_some_and(|cookie| cookie_has_value(cookie, "buvid3"))
+        {
+            return;
+        }
+        let response = match self
+            .client
+            .get(format!("{}/x/frontend/finger/spi", self.api_base))
+            .header("Referer", "https://www.bilibili.com/")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return,
+        };
+        let value = match json_response(response, "Bilibili device API").await {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let Some(buvid3) = get_str(&value, "/data/b_3").filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let buvid4 = get_str(&value, "/data/b_4").filter(|value| !value.is_empty());
+        let mut values = parse_cookie_pairs(current.as_deref().unwrap_or_default());
+        values.insert("buvid3".into(), buvid3.into());
+        if let Some(buvid4) = buvid4 {
+            values.insert("buvid4".into(), buvid4.into());
+        }
+        let cookie = values
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let _ = self.credentials.set_bilibili(cookie).await;
     }
 
     async fn parse_audio(&self, url: &str) -> ProviderResult<ParsedContent> {
@@ -628,6 +856,343 @@ impl BilibiliProvider {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DynamicPicture {
+    url: String,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+struct OpusProjection {
+    title: String,
+    text: String,
+    pictures: Vec<DynamicPicture>,
+}
+
+fn is_bilibili_host(host: &str) -> bool {
+    host == "bilibili.com" || host.ends_with(".bilibili.com") || host == "b23.tv"
+}
+
+fn bare_bvid_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX
+        .get_or_init(|| Regex::new(r"(?i)^BV[0-9A-Za-z]{10}(?:\?|$)").expect("valid bare BV regex"))
+}
+
+fn bare_av_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)^av(\d{2,})(?:\?|$)").expect("valid bare av regex"))
+}
+
+fn av_path_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)^av\d+$").expect("valid av path regex"))
+}
+
+fn ep_path_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)^(?:ep|ss)\d+$").expect("valid episode regex"))
+}
+
+fn audio_path_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)^au\d+$").expect("valid audio path regex"))
+}
+
+fn article_path_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)^(?:cv\d+|mobile)$").expect("valid article path regex"))
+}
+
+fn author_from_item(item: &Value) -> Author {
+    let value = item
+        .pointer("/modules/module_author")
+        .and_then(|author| author.get("author").or(Some(author)))
+        .unwrap_or(&Value::Null);
+    let mid = get_u64(value, "/mid").or_else(|| get_u64(item, "/basic/uid"));
+    Author {
+        id: mid.map(|value| value.to_string()).unwrap_or_default(),
+        name: get_str(value, "/name")
+            .or_else(|| get_str(value, "/uname"))
+            .unwrap_or_default()
+            .into(),
+        url: mid.map(|value| format!("https://space.bilibili.com/{value}")),
+        avatar_url: get_str(value, "/face")
+            .or_else(|| get_str(value, "/avatar"))
+            .map(str::to_string),
+    }
+}
+
+fn stats_from_item(item: &Value) -> Stats {
+    Stats {
+        likes: get_u64(item, "/modules/module_stat/like/count"),
+        reposts: get_u64(item, "/modules/module_stat/forward/count"),
+        replies: get_u64(item, "/modules/module_stat/comment/count"),
+        views: get_u64(item, "/modules/module_stat/view/count"),
+    }
+}
+
+fn dynamic_text(dynamic: &Value) -> String {
+    let text = get_str(dynamic, "/desc/text")
+        .or_else(|| get_str(dynamic, "/major/opus/summary/text"))
+        .unwrap_or_default();
+    if !text.is_empty() {
+        return text.to_string();
+    }
+    dynamic
+        .pointer("/desc/rich_text_nodes")
+        .and_then(Value::as_array)
+        .map(|nodes| render_rich_text_nodes(nodes))
+        .unwrap_or_default()
+}
+
+fn render_rich_text_nodes(nodes: &[Value]) -> String {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            get_str(node, "/text")
+                .or_else(|| get_str(node, "/orig_text"))
+                .or_else(|| get_str(node, "/emoji/text"))
+        })
+        .collect()
+}
+
+fn major_title(major: &Value) -> String {
+    let title = [
+        "/opus/title",
+        "/archive/title",
+        "/pgc/title",
+        "/article/title",
+        "/music/title",
+        "/live/title",
+        "/common/title",
+        "/title",
+    ]
+    .into_iter()
+    .find_map(|pointer| get_str(major, pointer).filter(|value| !value.is_empty()));
+    if let Some(title) = title {
+        return title.to_string();
+    }
+    live_rcmd_value(major)
+        .as_ref()
+        .and_then(|value| {
+            ["/title", "/room_info/title"]
+                .into_iter()
+                .find_map(|pointer| get_str(value, pointer))
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn major_cover(major: &Value) -> Option<String> {
+    let cover = [
+        "/archive/cover",
+        "/pgc/cover",
+        "/article/cover",
+        "/article/covers/0",
+        "/music/cover",
+        "/live/cover",
+        "/common/cover",
+        "/cover",
+    ]
+    .into_iter()
+    .find_map(|pointer| get_str(major, pointer).and_then(normalize_asset_url));
+    cover.or_else(|| {
+        live_rcmd_value(major).as_ref().and_then(|value| {
+            ["/cover", "/keyframe", "/room_info/cover"]
+                .into_iter()
+                .find_map(|pointer| get_str(value, pointer).and_then(normalize_asset_url))
+        })
+    })
+}
+
+fn live_rcmd_value(major: &Value) -> Option<Value> {
+    get_str(major, "/live_rcmd/content").and_then(|content| serde_json::from_str(content).ok())
+}
+
+fn pictures_from_dynamic(dynamic: &Value) -> Vec<DynamicPicture> {
+    dynamic
+        .pointer("/major/opus/pics")
+        .or_else(|| dynamic.pointer("/major/draw/items"))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(dynamic_picture).collect())
+        .unwrap_or_default()
+}
+
+fn dynamic_picture(value: &Value) -> Option<DynamicPicture> {
+    let url = get_str(value, "/url")
+        .or_else(|| get_str(value, "/src"))
+        .or_else(|| get_str(value, "/live_url"))
+        .and_then(normalize_asset_url)?;
+    Some(DynamicPicture {
+        url,
+        width: get_u64(value, "/width").and_then(|value| u32::try_from(value).ok()),
+        height: get_u64(value, "/height").and_then(|value| u32::try_from(value).ok()),
+    })
+}
+
+fn normalize_asset_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with("//") {
+        return Some(format!("https:{value}"));
+    }
+    if let Some(stripped) = value.strip_prefix("http://") {
+        return Some(format!("https://{stripped}"));
+    }
+    value.starts_with("https://").then(|| value.to_string())
+}
+
+fn media_from_pictures(
+    id: &str,
+    pictures: Vec<DynamicPicture>,
+    headers: &BTreeMap<String, String>,
+) -> Vec<MediaItem> {
+    let mut seen = HashSet::new();
+    pictures
+        .into_iter()
+        .filter(|picture| seen.insert(picture.url.clone()))
+        .enumerate()
+        .map(|(index, picture)| {
+            photo_media(
+                id,
+                index,
+                &picture.url,
+                picture.width,
+                picture.height,
+                headers,
+            )
+        })
+        .collect()
+}
+
+fn photo_media(
+    id: &str,
+    index: usize,
+    url: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    headers: &BTreeMap<String, String>,
+) -> MediaItem {
+    MediaItem {
+        kind: MediaKind::Photo,
+        source_url: url.to_string(),
+        fallback_urls: Vec::new(),
+        thumbnail_url: None,
+        filename: filename_from_url(url, &format!("bilibili-dynamic-{id}-{index}.jpg")),
+        mime_type: None,
+        duration_secs: None,
+        width,
+        height,
+        size: None,
+        headers: headers.clone(),
+        cache_key: format!("bilibili:dynamic:{id}:photo:{index}"),
+        requires_download: true,
+        secondary_url: None,
+        secondary_fallback_urls: Vec::new(),
+    }
+}
+
+fn embedded_url(major: &Value) -> Option<String> {
+    let archive = major.get("archive").unwrap_or(&Value::Null);
+    if let Some(bvid) = get_str(archive, "/bvid") {
+        return Some(format!("https://www.bilibili.com/video/{bvid}"));
+    }
+    if let Some(aid) = get_u64(archive, "/aid") {
+        return Some(format!("https://www.bilibili.com/video/av{aid}"));
+    }
+    for pointer in [
+        "/archive/jump_url",
+        "/pgc/jump_url",
+        "/article/jump_url",
+        "/music/jump_url",
+        "/live/jump_url",
+        "/common/jump_url",
+        "/ugc_season/jump_url",
+    ] {
+        if let Some(url) = get_str(major, pointer).and_then(normalize_asset_url) {
+            return Some(url);
+        }
+    }
+    if let Some(auid) = get_u64(major, "/music/id") {
+        return Some(format!("https://www.bilibili.com/audio/au{auid}"));
+    }
+    if let Some(article_id) = get_u64(major, "/article/id") {
+        return Some(format!("https://www.bilibili.com/read/cv{article_id}"));
+    }
+    if let Some(room_id) = get_u64(major, "/live/room_id").or_else(|| get_u64(major, "/live/id")) {
+        return Some(format!("https://live.bilibili.com/{room_id}"));
+    }
+    if let Some(value) = live_rcmd_value(major)
+        && let Some(room_id) = get_u64(&value, "/room_id")
+            .or_else(|| get_u64(&value, "/live_id"))
+            .or_else(|| get_u64(&value, "/room_info/room_id"))
+    {
+        return Some(format!("https://live.bilibili.com/{room_id}"));
+    }
+    None
+}
+
+fn opus_paragraph_text(paragraph: &Value) -> String {
+    if let Some(nodes) = paragraph.pointer("/text/nodes").and_then(Value::as_array) {
+        let text = nodes
+            .iter()
+            .filter_map(|node| {
+                get_str(node, "/word/words")
+                    .or_else(|| get_str(node, "/rich/text"))
+                    .or_else(|| get_str(node, "/rich/orig_text"))
+            })
+            .collect::<String>();
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    if let Some(content) = get_str(paragraph, "/code/content") {
+        return content.to_string();
+    }
+    if let Some(items) = paragraph.pointer("/list/items").and_then(Value::as_array) {
+        return items
+            .iter()
+            .filter_map(|item| {
+                item.pointer("/nodes")
+                    .and_then(Value::as_array)
+                    .map(|nodes| {
+                        nodes
+                            .iter()
+                            .filter_map(|node| {
+                                get_str(node, "/word/words").or_else(|| get_str(node, "/rich/text"))
+                            })
+                            .collect::<String>()
+                    })
+            })
+            .filter(|text| !text.is_empty())
+            .map(|text| format!("- {text}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    get_str(paragraph, "/text/text")
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn cookie_has_value(cookie: &str, name: &str) -> bool {
+    parse_cookie_pairs(cookie)
+        .get(name)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn parse_cookie_pairs(cookie: &str) -> BTreeMap<String, String> {
+    cookie
+        .split(';')
+        .filter_map(|pair| pair.trim().split_once('='))
+        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
+}
+
 fn rewrite_cdn_host(value: &str, host: &str) -> Option<String> {
     let mut url = url::Url::parse(value).ok()?;
     url.set_host(Some(host)).ok()?;
@@ -665,24 +1230,50 @@ impl Provider for BilibiliProvider {
     fn platform(&self) -> Platform {
         Platform::Bilibili
     }
-    fn can_handle(&self, url: &str) -> bool {
-        self.matcher.is_match(url)
+    fn can_handle(&self, raw: &str) -> bool {
+        if bare_bvid_regex().is_match(raw.trim()) || bare_av_regex().is_match(raw.trim()) {
+            return true;
+        }
+        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+            raw.to_string()
+        } else {
+            format!("https://{raw}")
+        };
+        url::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|host| is_bilibili_host(&host))
     }
     async fn parse(&self, request: &ParseRequest) -> ProviderResult<ParsedContent> {
         let url = self.resolve(&request.url).await?;
-        if url.contains("live.bilibili.com") {
-            self.parse_live(&url).await
-        } else if url.contains("/opus/")
-            || url.contains("/dynamic/")
-            || url.contains("t.bilibili.com")
-        {
-            self.parse_dynamic(&url).await
-        } else if url.contains("/audio/au") {
-            self.parse_audio(&url).await
-        } else if url.contains("/read/") {
-            self.parse_article(&url).await
-        } else {
-            self.parse_video(&url, &request.options).await
+        match self.target(&url)? {
+            BilibiliTarget::Live(room) => {
+                self.parse_live(&format!("https://live.bilibili.com/{room}"))
+                    .await
+            }
+            BilibiliTarget::Dynamic(id) => self.parse_dynamic(&url, &id, &request.options).await,
+            BilibiliTarget::Audio(audio) => {
+                self.parse_audio(&format!("https://www.bilibili.com/audio/{audio}"))
+                    .await
+            }
+            BilibiliTarget::Article(article) => {
+                self.parse_article(&format!("https://www.bilibili.com/read/{article}"))
+                    .await
+            }
+            BilibiliTarget::Video(video) => {
+                self.parse_video(
+                    &format!("https://www.bilibili.com/video/{video}"),
+                    &request.options,
+                )
+                .await
+            }
+            BilibiliTarget::Bangumi(episode) => {
+                self.parse_video(
+                    &format!("https://www.bilibili.com/bangumi/play/{episode}"),
+                    &request.options,
+                )
+                .await
+            }
         }
     }
 }

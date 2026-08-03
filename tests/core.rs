@@ -68,12 +68,14 @@ fn registry_routes_all_supported_platforms() {
             "https://www.bilibili.com/video/BV1xx411c7mD",
             Platform::Bilibili,
         ),
+        ("https://t.bilibili.com/123456789", Platform::Bilibili),
         ("https://music.163.com/#/song?id=123", Platform::Netease),
     ];
     for (url, platform) in cases {
         assert_eq!(registry.find(url).unwrap().platform(), platform);
     }
     assert!(registry.find("https://example.com").is_none());
+    assert!(registry.find("https://example.com/bilibili.com").is_none());
 }
 
 #[test]
@@ -560,6 +562,224 @@ async fn bilibili_bangumi_episode_resolves_through_season_api() {
         .await
         .unwrap();
     assert_eq!(parsed.title, "番剧正片");
+}
+
+#[tokio::test]
+async fn bilibili_dynamic_parses_text_and_images() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x/polymer/web-dynamic/v1/detail"))
+        .and(query_param("id", "123456789"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"item": {
+                "id_str": "123456789",
+                "type": "DYNAMIC_TYPE_DRAW",
+                "modules": {
+                    "module_author": {"mid": 7, "name": "动态作者", "face": "https://img/face.jpg"},
+                    "module_dynamic": {
+                        "desc": {"text": "动态正文"},
+                        "major": {"type": "MAJOR_TYPE_DRAW", "draw": {"items": [
+                            {"src": "//img/one.jpg", "width": 100, "height": 80},
+                            {"src": "https://img/two.jpg", "width": 200, "height": 160}
+                        ]}
+                    }},
+                    "module_stat": {"like": {"count": 3}, "forward": {"count": 2}, "comment": {"count": 1}}
+                }
+            }}
+        })))
+        .mount(&server)
+        .await;
+    let mut c = config();
+    c.bilibili_api_base = server.uri();
+    let parsed = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "https://t.bilibili.com/123456789".into(),
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(parsed.kind, ContentKind::Post);
+    assert_eq!(parsed.author.name, "动态作者");
+    assert_eq!(parsed.text, "动态正文");
+    assert_eq!(parsed.stats.likes, Some(3));
+    assert_eq!(parsed.media.len(), 2);
+    assert_eq!(parsed.media[0].source_url, "https://img/one.jpg");
+    assert_eq!(
+        parsed.media[0].cache_key,
+        "bilibili:dynamic:123456789:photo:0"
+    );
+    assert!(parsed.media.iter().all(|item| item.requires_download));
+}
+
+#[tokio::test]
+async fn bilibili_dynamic_opus_uses_full_detail_when_available() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x/polymer/web-dynamic/v1/detail"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"item": {
+                "id_str": "987654321",
+                "type": "DYNAMIC_TYPE_DRAW",
+                "modules": {
+                    "module_author": {"mid": 8, "name": "Opus作者"},
+                    "module_dynamic": {
+                        "desc": {"text": "摘要"},
+                        "major": {"type": "MAJOR_TYPE_OPUS", "opus": {
+                            "title": "短标题",
+                            "summary": {"text": "摘要"},
+                            "pics": []
+                        }
+                    }},
+                    "module_stat": {"like": {"count": 9}}
+                }
+            }}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/polymer/web-dynamic/v1/opus/detail"))
+        .and(query_param("id", "987654321"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"item": {
+                "basic": {"title": "完整标题"},
+                "modules": [
+                    {"module_title": {"text": "完整标题"}},
+                    {"module_content": {"paragraphs": [
+                        {"para_type": 1, "text": {"nodes": [
+                            {"type": "TEXT_NODE_TYPE_WORD", "word": {"words": "第一段"}}
+                        ]}},
+                        {"para_type": 2, "pic": {"pics": [
+                            {"url": "https://img/opus.jpg", "width": 640, "height": 360}
+                        ]}},
+                        {"para_type": 1, "text": {"nodes": [
+                            {"type": "TEXT_NODE_TYPE_WORD", "word": {"words": "第二段"}}
+                        ]}}
+                    ]}}
+                ]
+            }}
+        })))
+        .mount(&server)
+        .await;
+    let mut c = config();
+    c.bilibili_api_base = server.uri();
+    let parsed = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "https://www.bilibili.com/opus/987654321".into(),
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(parsed.title, "完整标题");
+    assert!(parsed.text.contains("第一段"));
+    assert!(parsed.text.contains("第二段"));
+    assert_eq!(parsed.media.len(), 1);
+    assert_eq!(parsed.media[0].width, Some(640));
+}
+
+#[tokio::test]
+async fn bilibili_forward_dynamic_keeps_outer_author_and_origin_media() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x/polymer/web-dynamic/v1/detail"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"item": {
+                "id_str": "222222222",
+                "type": "DYNAMIC_TYPE_FORWARD",
+                "modules": {
+                    "module_author": {"mid": 10, "name": "转发者"},
+                    "module_dynamic": {"desc": {"text": "外层附言"}},
+                    "module_stat": {"forward": {"count": 4}}
+                },
+                "orig": {
+                    "id_str": "111111111",
+                    "type": "DYNAMIC_TYPE_DRAW",
+                    "modules": {
+                        "module_author": {"mid": 11, "name": "原作者"},
+                        "module_dynamic": {
+                            "desc": {"text": "原动态"},
+                            "major": {"type": "MAJOR_TYPE_DRAW", "draw": {"items": [
+                                {"src": "https://img/origin.jpg"}
+                            ]}
+                        }}
+                    }
+                }
+            }}
+        })))
+        .mount(&server)
+        .await;
+    let mut c = config();
+    c.bilibili_api_base = server.uri();
+    let parsed = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "https://t.bilibili.com/222222222".into(),
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(parsed.author.name, "转发者");
+    assert!(parsed.text.contains("外层附言"));
+    assert!(parsed.text.contains("转发自 原作者"));
+    assert_eq!(parsed.media[0].source_url, "https://img/origin.jpg");
+    assert!(
+        parsed.media[0]
+            .cache_key
+            .starts_with("bilibili:dynamic:111111111:")
+    );
+}
+
+#[tokio::test]
+async fn bilibili_dynamic_archive_reuses_video_parser() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x/polymer/web-dynamic/v1/detail"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"item": {
+                "id_str": "333333333",
+                "type": "DYNAMIC_TYPE_AV",
+                "modules": {
+                    "module_author": {"mid": 12, "name": "视频作者"},
+                    "module_dynamic": {"desc": {"text": "视频动态"}, "major": {
+                        "type": "MAJOR_TYPE_ARCHIVE",
+                        "archive": {"bvid": "BV1xx411c7mD", "title": "卡片标题", "cover": "https://img/cover.jpg"}
+                    }}
+                }
+            }}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/web-interface/view"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"bvid": "BV1xx411c7mD", "cid": 42, "title": "视频标题", "owner": {"mid": 1, "name": "UP"}, "stat": {}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/player/playurl"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"durl": [{"url": "https://media/dynamic.mp4", "size": 1}]}
+        })))
+        .mount(&server)
+        .await;
+    let mut c = config();
+    c.bilibili_api_base = server.uri();
+    let parsed = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "https://www.bilibili.com/opus/333333333".into(),
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(parsed.title, "卡片标题");
+    assert_eq!(parsed.media[0].kind, congmiao_feedbot::MediaKind::Video);
+    assert_eq!(parsed.media[0].source_url, "https://media/dynamic.mp4");
 }
 
 #[tokio::test]

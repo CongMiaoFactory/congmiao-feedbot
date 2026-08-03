@@ -500,7 +500,7 @@ async fn send_content(
                         }
                     };
                 prepared.push(prepared_media);
-                let c = if i == 0 {
+                let c = if offset == size && i == 0 {
                     Some(caption_text.clone())
                 } else {
                     None
