@@ -183,7 +183,7 @@ docker run -d --name netease-api -p 3000:3000 moefurina/ncm-api:latest
 ### 4.2 下载并运行
 
 ```bash
-VERSION=v0.2.15
+VERSION=v0.2.16
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
 curl -LO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
