@@ -23,6 +23,9 @@ enum BilibiliTarget {
 }
 
 const OPUS_FEATURES: &str = "itemOpusStyle,opusBigCover,onlyfansVote,endFooterHidden,decorationCard,onlyfansAssetsV2,ugcDelete,onlyfansQaCard,commentsNewVersion";
+const BILIBILI_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const BILIBILI_ACCEPT: &str = "application/json, text/plain, */*";
+const BILIBILI_ACCEPT_LANGUAGE: &str = "zh-CN,zh;q=0.9,en;q=0.8";
 
 pub struct BilibiliProvider {
     client: Client,
@@ -61,35 +64,50 @@ impl BilibiliProvider {
         }
     }
     async fn response(&self, url: &str, params: &[(&str, &str)]) -> ProviderResult<Value> {
-        let mut req = self
-            .client
-            .get(url)
-            .query(params)
-            .header("Referer", "https://www.bilibili.com/");
-        if let Some(cookie) = self.credentials.bilibili().await {
-            req = req.header("Cookie", cookie);
+        for attempt in 0..2 {
+            let mut req = self
+                .client
+                .get(url)
+                .query(params)
+                .header("User-Agent", BILIBILI_BROWSER_USER_AGENT)
+                .header("Accept", BILIBILI_ACCEPT)
+                .header("Accept-Language", BILIBILI_ACCEPT_LANGUAGE)
+                .header("Origin", "https://www.bilibili.com")
+                .header("Referer", "https://www.bilibili.com/");
+            if let Some(cookie) = self.credentials.bilibili().await {
+                req = req.header("Cookie", cookie);
+            }
+            let value = json_response(
+                req.send()
+                    .await
+                    .map_err(|e| ProviderError::Upstream(e.to_string()))?,
+                "Bilibili API",
+            )
+            .await?;
+            let code = value
+                .get("code")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            if code == -352 && attempt == 0 {
+                self.ensure_buvid3(true).await;
+                continue;
+            }
+            if code != 0 {
+                let message = get_str(&value, "/message").unwrap_or("未知错误");
+                return Err(match code {
+                    -101 => ProviderError::Authentication(format!("Bilibili: {message}")),
+                    -352 | 412 => ProviderError::RateLimited(format!(
+                        "Bilibili 风控校验失败（{message}），请稍后重试或使用 /login bili 更新登录状态"
+                    )),
+                    404 | 4101139 => ProviderError::Unavailable(format!("Bilibili: {message}")),
+                    _ => ProviderError::Upstream(format!("Bilibili: {message}")),
+                });
+            }
+            return Ok(value);
         }
-        let value = json_response(
-            req.send()
-                .await
-                .map_err(|e| ProviderError::Upstream(e.to_string()))?,
-            "Bilibili API",
-        )
-        .await?;
-        let code = value
-            .get("code")
-            .and_then(Value::as_i64)
-            .unwrap_or_default();
-        if code != 0 {
-            let message = get_str(&value, "/message").unwrap_or("未知错误");
-            return Err(match code {
-                -101 => ProviderError::Authentication(format!("Bilibili: {message}")),
-                -352 | 412 => ProviderError::RateLimited(format!("Bilibili: {message}")),
-                404 | 4101139 => ProviderError::Unavailable(format!("Bilibili: {message}")),
-                _ => ProviderError::Upstream(format!("Bilibili: {message}")),
-            });
-        }
-        Ok(value)
+        Err(ProviderError::RateLimited(
+            "Bilibili 风控校验失败，请稍后重试".into(),
+        ))
     }
     async fn resolve(&self, raw: &str) -> ProviderResult<String> {
         if let Some(c) = bare_bvid_regex().captures(raw.trim()) {
@@ -114,6 +132,8 @@ impl BilibiliProvider {
         let response = self
             .client
             .head(&url)
+            .header("User-Agent", BILIBILI_BROWSER_USER_AGENT)
+            .header("Accept-Language", BILIBILI_ACCEPT_LANGUAGE)
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
@@ -193,7 +213,11 @@ impl BilibiliProvider {
         Err(ProviderError::Unsupported(url.into()))
     }
     async fn headers(&self) -> BTreeMap<String, String> {
-        let mut headers = BTreeMap::from([("Referer".into(), "https://www.bilibili.com/".into())]);
+        let mut headers = BTreeMap::from([
+            ("Referer".into(), "https://www.bilibili.com/".into()),
+            ("User-Agent".into(), BILIBILI_BROWSER_USER_AGENT.into()),
+            ("Accept-Language".into(), BILIBILI_ACCEPT_LANGUAGE.into()),
+        ]);
         if let Some(cookie) = self.credentials.bilibili().await {
             headers.insert("Cookie".into(), cookie);
         }
@@ -515,6 +539,7 @@ impl BilibiliProvider {
         id: &str,
         options: &ParseOptions,
     ) -> ProviderResult<ParsedContent> {
+        self.ensure_buvid3(false).await;
         let root = self
             .response(
                 &format!("{}/x/polymer/web-dynamic/v1/detail", self.api_base),
@@ -637,7 +662,7 @@ impl BilibiliProvider {
     }
 
     async fn parse_opus_detail(&self, id: &str) -> ProviderResult<OpusProjection> {
-        self.ensure_buvid3().await;
+        self.ensure_buvid3(false).await;
         let root = self
             .response(
                 &format!("{}/x/polymer/web-dynamic/v1/opus/detail", self.api_base),
@@ -688,17 +713,22 @@ impl BilibiliProvider {
         })
     }
 
-    async fn ensure_buvid3(&self) {
+    async fn ensure_buvid3(&self, force_refresh: bool) {
         let current = self.credentials.bilibili().await;
-        if current
-            .as_deref()
-            .is_some_and(|cookie| cookie_has_value(cookie, "buvid3"))
+        if !force_refresh
+            && current
+                .as_deref()
+                .is_some_and(|cookie| cookie_has_value(cookie, "buvid3"))
         {
             return;
         }
         let response = match self
             .client
             .get(format!("{}/x/frontend/finger/spi", self.api_base))
+            .header("User-Agent", BILIBILI_BROWSER_USER_AGENT)
+            .header("Accept", BILIBILI_ACCEPT)
+            .header("Accept-Language", BILIBILI_ACCEPT_LANGUAGE)
+            .header("Origin", "https://www.bilibili.com")
             .header("Referer", "https://www.bilibili.com/")
             .send()
             .await

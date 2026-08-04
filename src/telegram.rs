@@ -500,7 +500,7 @@ async fn send_content(
                         }
                     };
                 prepared.push(prepared_media);
-                let c = if offset == size && i == 0 {
+                let c = if offset == selected.len() && i == 0 {
                     Some(caption_text.clone())
                 } else {
                     None
@@ -1381,59 +1381,33 @@ fn parse_options(text: &str) -> ParseOptions {
 }
 
 pub fn caption(content: &ParsedContent, max: usize) -> String {
-    let title = ellipsize(&content.title, (max * 15 / 100).clamp(60, 300));
+    let title = escaped_text_excerpt(&content.title, (max * 15 / 100).clamp(60, 300));
     let source = if title.is_empty() {
         content.platform.as_str().to_string()
     } else {
         format!("{}：{title}", content.platform.as_str())
     };
-    let mut parts = vec![format!(
-        "<a href=\"{}\">{}</a>",
-        html_escape::encode_double_quoted_attribute(&content.canonical_url),
-        html_escape::encode_text(&source)
-    )];
+    let source = format!(
+        "<a href=\"{}\">{source}</a>",
+        html_escape::encode_double_quoted_attribute(&content.canonical_url)
+    );
 
-    let mut summary = content.text.clone();
-    if !content.collection_items.is_empty() {
-        if !summary.is_empty() {
-            summary.push_str("\n\n");
-        }
-        summary.push_str(
-            &content
-                .collection_items
-                .iter()
-                .take(30)
-                .enumerate()
-                .map(|(i, item)| format!("{}. {item}", i + 1))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-    }
-    if !summary.is_empty() {
-        let expandable = summary.chars().count() > 300;
-        let summary = ellipsize(&summary, (max * 35 / 100).clamp(180, 1800));
-        let attribute = if expandable { " expandable" } else { "" };
-        parts.push(format!(
-            "<blockquote{attribute}>{}</blockquote>",
-            html_escape::encode_text(&summary)
-        ));
-    }
-
+    let mut trailing_parts = Vec::new();
     if !content.author.name.is_empty() {
-        let author_name = ellipsize(&content.author.name, (max * 10 / 100).clamp(40, 160));
-        let author = html_escape::encode_text(&author_name);
+        let author_name =
+            escaped_text_excerpt(&content.author.name, (max * 10 / 100).clamp(40, 160));
         let author = content
             .author
             .url
             .as_ref()
             .map(|url| {
                 format!(
-                    "<a href=\"{}\">{author}</a>",
+                    "<a href=\"{}\">{author_name}</a>",
                     html_escape::encode_double_quoted_attribute(url)
                 )
             })
-            .unwrap_or_else(|| author.to_string());
-        parts.push(format!("作者：{author}"));
+            .unwrap_or(author_name);
+        trailing_parts.push(format!("作者：{author}"));
     }
 
     let view_label = match content.platform {
@@ -1451,18 +1425,88 @@ pub fn caption(content: &ParsedContent, max: usize) -> String {
     .collect::<Vec<_>>()
     .join("　");
     if !stats.is_empty() {
-        parts.push(format!("<blockquote>{stats}</blockquote>"));
+        trailing_parts.push(format!("<blockquote>{stats}</blockquote>"));
     }
+
+    let mut summary = content.text.clone();
+    if !content.collection_items.is_empty() {
+        if !summary.is_empty() {
+            summary.push_str("\n\n");
+        }
+        summary.push_str(
+            &content
+                .collection_items
+                .iter()
+                .take(30)
+                .enumerate()
+                .map(|(index, item)| format!("{}. {item}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    let mut parts = vec![source];
+    if !summary.is_empty() {
+        let expandable = summary.chars().count() > 300;
+        let fixed_chars = parts
+            .iter()
+            .chain(trailing_parts.iter())
+            .map(|part| part.chars().count())
+            .sum::<usize>();
+        let separator_chars = trailing_parts.len() + 1;
+        let tag_chars = if expandable {
+            "<blockquote expandable></blockquote>".chars().count()
+        } else {
+            "<blockquote></blockquote>".chars().count()
+        };
+        let available = max.saturating_sub(fixed_chars + separator_chars + tag_chars);
+        let summary_limit = if expandable {
+            available.min(max.saturating_mul(70) / 100)
+        } else {
+            available
+        };
+        if summary_limit > 0 {
+            let summary = escaped_text_excerpt(&summary, summary_limit);
+            if !summary.is_empty() {
+                let attribute = if expandable { " expandable" } else { "" };
+                parts.push(format!("<blockquote{attribute}>{summary}</blockquote>"));
+            }
+        }
+    }
+    parts.extend(trailing_parts);
     truncate_html(&parts.join("\n"), max)
 }
 
-fn ellipsize(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
+fn escaped_text_excerpt(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
     }
-    let mut value = text.chars().take(max.saturating_sub(1)).collect::<String>();
-    value.push('…');
-    value
+    let encoded = html_escape::encode_text(text).to_string();
+    if encoded.chars().count() <= max {
+        return encoded;
+    }
+    if max == 1 {
+        return "…".into();
+    }
+
+    let target = max - 1;
+    let mut excerpt = String::new();
+    let mut last_boundary = None;
+    for character in text.chars() {
+        let encoded_character = html_escape::encode_text(&character.to_string()).to_string();
+        if excerpt.chars().count() + encoded_character.chars().count() > target {
+            break;
+        }
+        excerpt.push_str(&encoded_character);
+        if character.is_whitespace() {
+            last_boundary = Some(excerpt.chars().count());
+        }
+    }
+    if let Some(boundary) = last_boundary.filter(|boundary| *boundary >= target / 2) {
+        excerpt = excerpt.chars().take(boundary).collect();
+    }
+    excerpt.push('…');
+    excerpt
 }
 
 fn format_count(value: u64) -> String {

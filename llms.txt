@@ -1,0 +1,42 @@
+# Congmiao FeedBot
+
+> AI/LLM entry point for a Rust Telegram multi-platform feed parser.
+
+Congmiao FeedBot accepts links from X, YouTube, Pixiv, Bilibili, and NetEase Cloud Music, normalizes upstream data, processes media, and sends Telegram messages. The project uses Rust 2024, Tokio, Teloxide, Reqwest, SQLx/SQLite, FFmpeg, ffprobe, and yt-dlp.
+
+## Essential Context
+
+- [AI project context](docs/AI_CONTEXT.md): architecture, request flow, modules, invariants, development, testing, deployment, operations, and release.
+- [Agent instructions](AGENTS.md): rules coding agents must follow when modifying this repository.
+- [README](README.md): authoritative user guide, configuration, commands, deployment, troubleshooting, and release instructions.
+- [Environment template](.env.example): supported environment variables and defaults.
+
+## Code Entry Points
+
+- [Application bootstrap](src/main.rs)
+- [Telegram integration](src/telegram.rs)
+- [Provider abstraction and registry](src/provider/mod.rs)
+- [Normalized domain model](src/model.rs)
+- [Media pipeline](src/media.rs)
+- [Configuration](src/config.rs)
+- [SQLite storage](src/storage.rs)
+- [Login flows](src/login.rs)
+- [Runtime credentials](src/credentials.rs)
+
+## Platform Providers
+
+- [X](src/provider/x.rs)
+- [YouTube](src/provider/youtube.rs)
+- [Pixiv](src/provider/pixiv.rs)
+- [Bilibili](src/provider/bilibili.rs)
+- [NetEase Cloud Music](src/provider/netease.rs)
+
+## Deployment and Validation
+
+- [Docker image](Dockerfile)
+- [Docker Compose stack](docker-compose.yml)
+- [Release workflow](.github/workflows/release.yml)
+- [Core integration tests](tests/core.rs)
+- [Media tests](tests/media.rs)
+
+The current package version and minimum Rust version are defined only in `Cargo.toml`. Never infer them from examples or release tags.

@@ -15,7 +15,7 @@ use congmiao_feedbot::{
 use reqwest::Client;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, path, query_param},
+    matchers::{header_regex, method, path, query_param},
 };
 
 fn config() -> Config {
@@ -138,6 +138,19 @@ fn caption_is_escaped_and_bounded() {
     assert!(value.contains("x：&lt;b&gt;not html&lt;/b&gt;"));
     assert!(value.contains("<blockquote expandable>"));
     assert!(value.contains("作者："));
+
+    content.text = "短".repeat(301);
+    let value = caption(&content, 1024);
+    assert!(value.contains(&format!(
+        "<blockquote expandable>{}</blockquote>",
+        "短".repeat(301)
+    )));
+
+    content.text = "第一段：".to_string() + &"内容".repeat(300);
+    let value = caption(&content, 1024);
+    assert!(value.chars().count() <= 1024);
+    assert!(value.contains("<blockquote expandable>"));
+    assert!(value.chars().count() > 600);
 
     content.text = "short description".into();
     let value = caption(&content, 1024);
@@ -570,6 +583,10 @@ async fn bilibili_dynamic_parses_text_and_images() {
     Mock::given(method("GET"))
         .and(path("/x/polymer/web-dynamic/v1/detail"))
         .and(query_param("id", "123456789"))
+        .and(header_regex(
+            "user-agent",
+            r"Mozilla/5\.0 .* Chrome/131\.0\.0\.0 Safari/537\.36",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "code": 0,
             "data": {"item": {
@@ -610,6 +627,65 @@ async fn bilibili_dynamic_parses_text_and_images() {
         "bilibili:dynamic:123456789:photo:0"
     );
     assert!(parsed.media.iter().all(|item| item.requires_download));
+}
+
+#[tokio::test]
+async fn bilibili_dynamic_refreshes_device_cookie_and_retries_risk_control() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x/frontend/finger/spi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "message": "ok",
+            "data": {"b_3": "test-buvid3", "b_4": "test-buvid4"}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/polymer/web-dynamic/v1/detail"))
+        .and(query_param("id", "352352352"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": -352,
+            "message": "-352"
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x/polymer/web-dynamic/v1/detail"))
+        .and(query_param("id", "352352352"))
+        .and(header_regex("cookie", r"buvid3=test-buvid3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"item": {
+                "id_str": "352352352",
+                "type": "DYNAMIC_TYPE_WORD",
+                "modules": {
+                    "module_author": {"mid": 12, "name": "重试作者"},
+                    "module_dynamic": {"desc": {"text": "重试成功"}}
+                }
+            }}
+        })))
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let mut c = config();
+    c.bilibili_api_base = server.uri();
+
+    let parsed = BilibiliProvider::new(Client::new(), &c)
+        .parse(&ParseRequest {
+            url: "https://m.bilibili.com/opus/352352352?unique_k=2333".into(),
+            options: ParseOptions::default(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(parsed.text, "重试成功");
+    assert_eq!(parsed.author.name, "重试作者");
 }
 
 #[tokio::test]
