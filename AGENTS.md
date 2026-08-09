@@ -22,7 +22,8 @@ Before changing code, read `docs/AI_CONTEXT.md`. Use `README.md` as the source o
 - `tests/core.rs`: provider, routing, caption, login, cache, and storage integration tests.
 - `tests/media.rs`: media processing tests.
 - `docker-compose.yml`, `Dockerfile`: container deployment.
-- `.github/workflows/release.yml`: `v*` tag release workflow.
+- `.github/workflows/ci.yml`: PR/main Rust validation and Docker image workflow; release-tag Rust validation is intentionally skipped because `release.yml` builds the release artifact.
+- `.github/workflows/release.yml`: `v*` tag musl binary and GitHub Release workflow.
 
 ## Architecture Rules
 
@@ -31,7 +32,7 @@ Before changing code, read `docs/AI_CONTEXT.md`. Use `README.md` as the source o
 3. Treat upstream JSON as unstable: parse defensively, support fallbacks, and map failures to `ProviderError`.
 4. Keep retries bounded. Do not introduce unbounded API, login, or media retries.
 5. Merge runtime cookies through `RuntimeCredentials`; do not overwrite existing login fields such as Bilibili `SESSDATA` or `bili_jct`.
-6. Escape Telegram HTML and respect 1024-character captions, 4096-character messages, and media-group constraints.
+6. Escape Telegram HTML and respect 1024-character captions, 4096-character messages, media-group constraints, and the unified three-photo limit in `src/telegram.rs`.
 7. Preserve secrets: never log tokens/cookies, commit `.env`, databases, QR credentials, or files under `secrets/`.
 8. Make focused changes; do not refactor unrelated modules or add dependencies without need.
 

@@ -2,10 +2,17 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+    tags:
+      - "v*"
   pull_request:
 
 jobs:
   rust:
+    # Release tags use release.yml's musl build; do not repeat the host build,
+    # clippy, and test suite on the same tag event.
+    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +27,9 @@ jobs:
       - run: cargo build --release --locked
 
   docker:
+    # Validate pull requests, publish main, and build the image for release
+    # tags. Feature-branch pushes do not need a second registry image.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,7 +61,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

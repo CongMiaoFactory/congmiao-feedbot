@@ -120,6 +120,174 @@ impl PixivProvider {
     }
 }
 
+fn pixiv_html_to_text(input: &str) -> String {
+    let mut output = String::new();
+    let mut links: Vec<(String, usize)> = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let Some(relative_start) = input[cursor..].find('<') else {
+            output.push_str(&input[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        output.push_str(&input[cursor..start]);
+        if input[start..].starts_with("<!--") {
+            if let Some(end) = input[start + 4..].find("-->") {
+                cursor = start + 4 + end + 3;
+                continue;
+            }
+            break;
+        }
+        let Some(end) = find_html_tag_end(input, start + 1) else {
+            output.push_str(&input[start..]);
+            break;
+        };
+        let raw_tag = input[start + 1..end].trim();
+        let closing = raw_tag.starts_with('/');
+        let tag = raw_tag
+            .trim_start_matches('/')
+            .trim_start_matches('!')
+            .trim_start_matches('?');
+        let name = tag
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        if name
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_alphabetic())
+        {
+            output.push_str(&input[start..=end]);
+            cursor = end + 1;
+            continue;
+        }
+        if name == "script" || name == "style" {
+            if !closing {
+                cursor = find_html_closing_tag(input, end + 1, &name).unwrap_or(input.len());
+                continue;
+            }
+            cursor = end + 1;
+            continue;
+        }
+        if name == "rt" || name == "rp" {
+            if !closing {
+                cursor = find_html_closing_tag(input, end + 1, &name).unwrap_or(input.len());
+                continue;
+            }
+            cursor = end + 1;
+            continue;
+        }
+        match (closing, name.as_str()) {
+            (false, "br") | (false, "hr") => append_newline(&mut output),
+            (false, "li") => {
+                append_newline(&mut output);
+                output.push_str("- ");
+            }
+            (true, "p")
+            | (true, "div")
+            | (true, "section")
+            | (true, "article")
+            | (true, "blockquote")
+            | (true, "h1")
+            | (true, "h2")
+            | (true, "h3")
+            | (true, "h4")
+            | (true, "h5")
+            | (true, "h6")
+            | (true, "li") => append_newline(&mut output),
+            (false, "img") => {
+                if let Some(alt) = html_attribute(tag, "alt") {
+                    output.push_str(&alt);
+                }
+            }
+            (false, "a") => {
+                if let Some(href) = html_attribute(tag, "href") {
+                    links.push((href, output.len()));
+                }
+            }
+            (true, "a") => {
+                if let Some((href, text_start)) = links.pop() {
+                    let visible = html_escape::decode_html_entities(&output[text_start..])
+                        .trim()
+                        .to_string();
+                    let href = html_escape::decode_html_entities(&href).to_string();
+                    if visible.is_empty() {
+                        output.push_str(&href);
+                    } else if !href.is_empty() && visible != href && !visible.contains(&href) {
+                        output.push('（');
+                        output.push_str(&href);
+                        output.push('）');
+                    }
+                }
+            }
+            _ => {}
+        }
+        cursor = end + 1;
+    }
+    normalize_pixiv_text(&html_escape::decode_html_entities(&output))
+}
+
+fn find_html_tag_end(input: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, character) in input[start..].char_indices() {
+        match (quote, character) {
+            (Some(expected), character) if character == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '>') => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_html_closing_tag(input: &str, start: usize, name: &str) -> Option<usize> {
+    let lower = input[start..].to_ascii_lowercase();
+    let marker = format!("</{name}");
+    let relative = lower.find(&marker)?;
+    let tag_start = start + relative;
+    find_html_tag_end(input, tag_start + 1).map(|end| end + 1)
+}
+
+fn html_attribute(tag: &str, name: &str) -> Option<String> {
+    let pattern = format!(r#"(?is)\b{name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#);
+    let captures = Regex::new(&pattern).ok()?.captures(tag)?;
+    captures
+        .get(1)
+        .or_else(|| captures.get(2))
+        .or_else(|| captures.get(3))
+        .map(|value| value.as_str().to_string())
+}
+
+fn append_newline(output: &mut String) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+}
+
+fn normalize_pixiv_text(input: &str) -> String {
+    let input = input.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = Vec::new();
+    let mut blank = false;
+    for raw_line in input.split('\n') {
+        let line = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            if !lines.is_empty() && !blank {
+                lines.push(String::new());
+                blank = true;
+            }
+        } else {
+            lines.push(line);
+            blank = false;
+        }
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 #[async_trait]
 impl Provider for PixivProvider {
     fn platform(&self) -> Platform {
@@ -306,15 +474,21 @@ impl Provider for PixivProvider {
             .or_else(|| body.pointer("/tags"))
             .and_then(Value::as_array)
             .map(|a| {
-                a.iter()
-                    .filter_map(|v| {
-                        v.as_str()
-                            .or_else(|| v.get("tag").and_then(Value::as_str))
-                            .or_else(|| v.get("name").and_then(Value::as_str))
-                    })
-                    .map(|s| format!("#{s}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                let mut tags = Vec::new();
+                for tag in a.iter().filter_map(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("tag").and_then(Value::as_str))
+                        .or_else(|| v.get("name").and_then(Value::as_str))
+                }) {
+                    let tag = tag.trim();
+                    if !tag.is_empty() {
+                        let tag = format!("#{tag}");
+                        if !tags.contains(&tag) {
+                            tags.push(tag);
+                        }
+                    }
+                }
+                tags.join(" ")
             })
             .unwrap_or_default();
         let sensitive = get_u64(body, "/xRestrict")
@@ -328,6 +502,7 @@ impl Provider for PixivProvider {
             });
         let description = get_str(body, "/description")
             .or_else(|| get_str(body, "/caption"))
+            .map(pixiv_html_to_text)
             .unwrap_or_default();
         Ok(ParsedContent {
             platform: Platform::Pixiv,

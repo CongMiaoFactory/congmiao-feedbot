@@ -127,7 +127,8 @@ Important invariants:
 
 - HTML parse mode requires all upstream text and attributes to be escaped.
 - Media captions are bounded to 1024 characters; text messages to 4096.
-- Long summaries use Telegram expandable blockquotes and retain title/author/stat metadata.
+- The Telegram selection layer (`MAX_PHOTOS_PER_CONTENT` in `src/telegram.rs`) caps every content's `MediaKind::Photo` items at the first three, regardless of provider. `+pN`, `cover_only`, and a persisted reply media key are explicit selections and take precedence.
+- Long summaries over 300 characters show an approximately 5% visible preview and put the remaining excerpt in an `expandable` blockquote; the visible preview is bounded to 16–180 characters and prefers whitespace boundaries.
 - A media group must contain 2 to 10 items; splitting must never leave a one-item group.
 - For multiple media-group batches, caption appears only once on the final batch.
 - Spoiler behavior combines upstream sensitivity, `MEDIA_SPOILER_MODE`, and the per-request `+sp` option.
@@ -135,6 +136,8 @@ Important invariants:
 - Replying with `/file` relies on the persisted `(chat_id, message_id)` media mapping.
 
 User-visible commands and flags are documented in `README.md`; inspect command parsing in `src/telegram.rs` before adding or renaming one.
+
+Pixiv descriptions are normalized to plain text in `src/provider/pixiv.rs` before entering `ParsedContent`: common block tags become line breaks, links retain readable text and URLs, entities are decoded, and script/style contents are discarded. Providers still must not emit Telegram HTML.
 
 ## 7. Persistence and Credentials
 
@@ -259,6 +262,8 @@ NetEase requests need a reachable sidecar; Compose is preferred over a standalon
 ### Release binary
 
 `.github/workflows/release.yml` runs for tags matching `v*`. It builds `x86_64-unknown-linux-musl`, packages the binary with `README.md`, `LICENSE`, and `.env.example`, generates SHA-256, and creates a GitHub Release.
+
+`.github/workflows/ci.yml` handles pull requests and `main` validation, and builds/publishes the GHCR image for `main` and `v*` tags. Its Rust job is skipped for release tags so the host build, tests, and Clippy are not duplicated alongside the musl release build.
 
 A binary deployment must separately install FFmpeg, ffprobe, and yt-dlp, create writable data/temp directories, supply environment variables, and use a supervisor such as systemd. Exact commands are in `README.md`.
 

@@ -28,6 +28,13 @@ use crate::{
     storage::Storage,
 };
 
+/// 单条内容默认最多发送三张图片；视频、音频、动画和文件不计入此限制。
+pub const MAX_PHOTOS_PER_CONTENT: usize = 3;
+const CONTENT_FOLD_THRESHOLD: usize = 300;
+const CONTENT_PREVIEW_PERCENT: usize = 5;
+const CONTENT_PREVIEW_MIN_CHARS: usize = 16;
+const CONTENT_PREVIEW_MAX_CHARS: usize = 180;
+
 #[derive(Clone)]
 pub struct BotState {
     pub config: Config,
@@ -448,11 +455,11 @@ async fn send_content(
     options: &ParseOptions,
 ) -> Result<()> {
     let _queue = state.queue.acquire().await?;
-    let caption_text = caption(&content, 1024);
+    let caption_text = caption_with_options(&content, 1024, options);
     let spoiler = media_has_spoiler(&state.config, &content)
         || (options.force_spoiler && has_visual_media(&content));
     if content.media.is_empty() {
-        bot.send_message(msg.chat.id, caption(&content, 4096))
+        bot.send_message(msg.chat.id, caption_with_options(&content, 4096, options))
             .reply_parameters(ReplyParameters::new(msg.id))
             .parse_mode(ParseMode::Html)
             .await?;
@@ -1274,7 +1281,18 @@ pub fn select_media_items<'a>(
             .collect());
     }
     let Some(page) = options.page else {
-        return Ok(content.media.iter().collect());
+        let mut photo_count = 0;
+        return Ok(content
+            .media
+            .iter()
+            .filter(|item| {
+                if item.kind != MediaKind::Photo {
+                    return true;
+                }
+                photo_count += 1;
+                photo_count <= MAX_PHOTOS_PER_CONTENT
+            })
+            .collect());
     };
     // Pixiv 等多图：页码按图片 1-based；若没有图片则回退到全部媒体序号。
     let photos: Vec<_> = content
@@ -1381,6 +1399,32 @@ fn parse_options(text: &str) -> ParseOptions {
 }
 
 pub fn caption(content: &ParsedContent, max: usize) -> String {
+    caption_inner(content, max, None)
+}
+
+pub fn caption_with_options(content: &ParsedContent, max: usize, options: &ParseOptions) -> String {
+    let omitted =
+        if options.page.is_none() && options.media_cache_key.is_none() && !options.cover_only {
+            let total = content
+                .media
+                .iter()
+                .filter(|item| item.kind == MediaKind::Photo)
+                .count();
+            (total > MAX_PHOTOS_PER_CONTENT).then(|| total - MAX_PHOTOS_PER_CONTENT)
+        } else {
+            None
+        };
+    let notice = omitted.map(|count| {
+        let total = count + MAX_PHOTOS_PER_CONTENT;
+        format!(
+            "图片较多，最多发送前 {} 张（共 {} 张）；其余请查看原链接。",
+            MAX_PHOTOS_PER_CONTENT, total
+        )
+    });
+    caption_inner(content, max, notice.as_deref())
+}
+
+fn caption_inner(content: &ParsedContent, max: usize, photo_notice: Option<&str>) -> String {
     let title = escaped_text_excerpt(&content.title, (max * 15 / 100).clamp(60, 300));
     let source = if title.is_empty() {
         content.platform.as_str().to_string()
@@ -1427,6 +1471,9 @@ pub fn caption(content: &ParsedContent, max: usize) -> String {
     if !stats.is_empty() {
         trailing_parts.push(format!("<blockquote>{stats}</blockquote>"));
     }
+    if let Some(notice) = photo_notice {
+        trailing_parts.push(html_escape::encode_text(notice).to_string());
+    }
 
     let mut summary = content.text.clone();
     if !content.collection_items.is_empty() {
@@ -1447,34 +1494,76 @@ pub fn caption(content: &ParsedContent, max: usize) -> String {
 
     let mut parts = vec![source];
     if !summary.is_empty() {
-        let expandable = summary.chars().count() > 300;
         let fixed_chars = parts
             .iter()
             .chain(trailing_parts.iter())
             .map(|part| part.chars().count())
             .sum::<usize>();
-        let separator_chars = trailing_parts.len() + 1;
-        let tag_chars = if expandable {
-            "<blockquote expandable></blockquote>".chars().count()
+        let expandable = summary.chars().count() > CONTENT_FOLD_THRESHOLD;
+        if expandable {
+            let preview_chars = preview_char_limit(summary.chars().count());
+            let (preview, remainder) = split_text_at_boundary(&summary, preview_chars);
+            let hidden_tag_chars = "<blockquote expandable></blockquote>".chars().count();
+            let separator_chars = trailing_parts.len() + 2;
+            let content_budget =
+                max.saturating_sub(fixed_chars + separator_chars + hidden_tag_chars);
+            if content_budget > 1 {
+                let preview_budget = content_budget.min(preview.chars().count() + 1);
+                let mut visible = escaped_text_excerpt(&preview, preview_budget.saturating_sub(1));
+                if !remainder.is_empty() {
+                    visible.push('…');
+                }
+                parts.push(visible);
+                let hidden_budget = content_budget
+                    .saturating_sub(parts.last().map(|part| part.chars().count()).unwrap_or(0) + 1);
+                if hidden_budget > 0 && !remainder.is_empty() {
+                    let hidden = escaped_text_excerpt(&remainder, hidden_budget);
+                    parts.push(format!("<blockquote expandable>{hidden}</blockquote>"));
+                }
+            }
         } else {
-            "<blockquote></blockquote>".chars().count()
-        };
-        let available = max.saturating_sub(fixed_chars + separator_chars + tag_chars);
-        let summary_limit = if expandable {
-            available.min(max.saturating_mul(70) / 100)
-        } else {
-            available
-        };
-        if summary_limit > 0 {
-            let summary = escaped_text_excerpt(&summary, summary_limit);
-            if !summary.is_empty() {
-                let attribute = if expandable { " expandable" } else { "" };
-                parts.push(format!("<blockquote{attribute}>{summary}</blockquote>"));
+            let tag_chars = "<blockquote></blockquote>".chars().count();
+            let separator_chars = trailing_parts.len() + 1;
+            let summary_budget = max.saturating_sub(fixed_chars + separator_chars + tag_chars);
+            if summary_budget > 0 {
+                let summary = escaped_text_excerpt(&summary, summary_budget);
+                if !summary.is_empty() {
+                    parts.push(format!("<blockquote>{summary}</blockquote>"));
+                }
             }
         }
     }
     parts.extend(trailing_parts);
     truncate_html(&parts.join("\n"), max)
+}
+
+fn preview_char_limit(total: usize) -> usize {
+    (total.saturating_mul(CONTENT_PREVIEW_PERCENT).div_ceil(100))
+        .clamp(CONTENT_PREVIEW_MIN_CHARS, CONTENT_PREVIEW_MAX_CHARS)
+}
+
+fn split_text_at_boundary(text: &str, max_chars: usize) -> (String, String) {
+    if text.chars().count() <= max_chars {
+        return (text.to_string(), String::new());
+    }
+    let mut byte_end = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    let mut boundary = None;
+    for (index, character) in text[..byte_end].char_indices().rev() {
+        if character.is_whitespace() {
+            boundary = Some(index);
+            break;
+        }
+    }
+    if let Some(index) = boundary.filter(|index| *index >= byte_end / 2) {
+        byte_end = index;
+    }
+    let preview = text[..byte_end].trim_end().to_string();
+    let remainder = text[byte_end..].trim_start().to_string();
+    (preview, remainder)
 }
 
 fn escaped_text_excerpt(text: &str, max: usize) -> String {

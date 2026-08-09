@@ -1,15 +1,15 @@
 use std::{path::PathBuf, time::Duration};
 
 use congmiao_feedbot::{
-    Config, ContentKind, ParseOptions, ParseRequest, Platform, Provider, ProviderRegistry,
-    RuntimeCredentials,
+    Config, ContentKind, MediaItem, MediaKind, ParseOptions, ParseRequest, Platform, Provider,
+    ProviderRegistry, RuntimeCredentials,
     cache::AppCache,
     login::{LoginPoll, LoginService},
     provider::{BilibiliProvider, NeteaseProvider, PixivProvider, XProvider},
     storage::Storage,
     telegram::{
-        caption, extract_urls, media_group_sizes, media_has_spoiler, select_media_items,
-        strip_url_flags,
+        MAX_PHOTOS_PER_CONTENT, caption, caption_with_options, extract_urls, media_group_sizes,
+        media_has_spoiler, select_media_items, strip_url_flags,
     },
 };
 use reqwest::Client;
@@ -114,6 +114,86 @@ fn media_groups_never_contain_a_single_item() {
 }
 
 #[test]
+fn select_media_items_caps_photos_across_all_content_types() {
+    let media = (0..5)
+        .map(|index| MediaItem {
+            kind: MediaKind::Photo,
+            source_url: format!("https://img.test/{index}.jpg"),
+            fallback_urls: vec![],
+            thumbnail_url: None,
+            filename: format!("{index}.jpg"),
+            mime_type: Some("image/jpeg".into()),
+            duration_secs: None,
+            width: None,
+            height: None,
+            size: None,
+            headers: Default::default(),
+            cache_key: format!("photo:{index}"),
+            requires_download: false,
+            secondary_url: None,
+            secondary_fallback_urls: vec![],
+        })
+        .collect::<Vec<_>>();
+    let content = congmiao_feedbot::ParsedContent {
+        platform: Platform::Bilibili,
+        kind: ContentKind::Post,
+        id: "photos".into(),
+        canonical_url: "https://example.com/photos".into(),
+        author: Default::default(),
+        title: "photos".into(),
+        text: String::new(),
+        sensitive: false,
+        stats: Default::default(),
+        media,
+        collection_items: vec![],
+    };
+
+    let selected = select_media_items(&content, &ParseOptions::default()).unwrap();
+    assert_eq!(MAX_PHOTOS_PER_CONTENT, 3);
+    assert_eq!(selected.len(), 3);
+    assert_eq!(selected[2].cache_key, "photo:2");
+
+    let selected_page = select_media_items(
+        &content,
+        &ParseOptions {
+            page: Some(5),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(selected_page.len(), 1);
+    assert_eq!(selected_page[0].cache_key, "photo:4");
+
+    let selected_reply = select_media_items(
+        &content,
+        &ParseOptions {
+            file_mode: true,
+            media_cache_key: Some("photo:4".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(selected_reply.len(), 1);
+    assert_eq!(selected_reply[0].cache_key, "photo:4");
+
+    let notice = caption_with_options(&content, 1024, &ParseOptions::default());
+    assert!(notice.contains("最多发送前 3 张（共 5 张）"));
+    let mut three_photos = content.clone();
+    three_photos.media.truncate(3);
+    let no_notice = caption_with_options(&three_photos, 1024, &ParseOptions::default());
+    assert!(!no_notice.contains("图片较多"));
+    let page_caption = caption_with_options(
+        &content,
+        1024,
+        &ParseOptions {
+            page: Some(5),
+            ..Default::default()
+        },
+    );
+    assert!(!page_caption.contains("图片较多"));
+}
+
+#[test]
 fn caption_is_escaped_and_bounded() {
     let mut content = congmiao_feedbot::ParsedContent {
         platform: Platform::X,
@@ -139,12 +219,17 @@ fn caption_is_escaped_and_bounded() {
     assert!(value.contains("<blockquote expandable>"));
     assert!(value.contains("作者："));
 
-    content.text = "短".repeat(301);
+    content.text = "短".repeat(1000);
     let value = caption(&content, 1024);
-    assert!(value.contains(&format!(
-        "<blockquote expandable>{}</blockquote>",
-        "短".repeat(301)
-    )));
+    let hidden_start = value.find("<blockquote expandable>").unwrap();
+    let visible_preview = &value[..hidden_start];
+    let preview_count = visible_preview
+        .chars()
+        .filter(|character| *character == '短')
+        .count();
+    assert!((16..=60).contains(&preview_count), "{preview_count}");
+    assert!(value.contains("<blockquote expandable>"));
+    assert!(value.chars().count() <= 1024);
 
     content.text = "第一段：".to_string() + &"内容".repeat(300);
     let value = caption(&content, 1024);
@@ -244,7 +329,7 @@ async fn x_provider_selects_h264_source_at_or_below_requested_quality() {
 async fn pixiv_provider_supports_multiple_pages() {
     let server = MockServer::start().await;
     Mock::given(method("GET")).and(path("/ajax/illust/123")).and(query_param("lang", "zh"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":{"title":"work","userId":"5","userName":"Artist","pageCount":2,"xRestrict":1,"tags":{"tags":[{"name":"R-18"},{"tag":"插画"}]}}}))).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":{"title":"work","userId":"5","userName":"Artist","pageCount":2,"xRestrict":1,"description":"<p>第一段<br>第二行</p><a href=\"https://x.test\">链接文字</a> &amp; 2 < 3 > 1 <script>alert(1)</script>","tags":{"tags":[{"name":"R-18"},{"tag":"插画"}]}}}))).mount(&server).await;
     Mock::given(method("GET")).and(path("/ajax/illust/123/pages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error":false,"body":[{"urls":{"original":"https://i.pximg.net/1.jpg","regular":"https://i.pximg.net/1-regular.jpg"}},{"urls":{"original":"https://i.pximg.net/2.jpg","regular":"https://i.pximg.net/2-regular.jpg"}}]}))).mount(&server).await;
     let mut c = config();
@@ -260,6 +345,12 @@ async fn pixiv_provider_supports_multiple_pages() {
     assert_eq!(parsed.author.name, "Artist");
     assert!(parsed.text.contains("#R-18"));
     assert!(parsed.text.contains("#插画"));
+    assert!(parsed.text.contains("第一段\n第二行"));
+    assert!(parsed.text.contains("链接文字（https://x.test） &"));
+    assert!(parsed.text.contains("2 < 3 > 1"));
+    assert!(!parsed.text.contains("<p>"));
+    assert!(!parsed.text.contains("<script>"));
+    assert!(!parsed.text.contains("alert(1)"));
     assert!(parsed.sensitive);
     assert!(media_has_spoiler(&c, &parsed));
 

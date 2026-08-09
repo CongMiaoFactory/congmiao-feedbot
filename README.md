@@ -2,7 +2,7 @@
 
 面向个人和小团队自托管的 Telegram 多平台内容解析 Bot。把支持的平台链接发送给 Bot，Bot 会提取正文、作者、统计信息和媒体，并在 Telegram 的限制范围内发送图片、视频、音频或文件。
 
-- 当前 Cargo 版本：`0.2.17`
+- 当前 Cargo 版本：`0.2.18`
 - 默认接收模式：Telegram Polling
 - 持久化：本地 SQLite
 - 推荐部署：Docker Compose
@@ -57,11 +57,13 @@ Bilibili 视频还支持 DASH 音视频选择、默认 480p 上限、H.264/AAC �
 
 - 默认视频清晰度最高不超过 480p，可用 `/video 720p` 等命令上调。
 - 下载支持超时、失败重试、HTTP Range 续传和 Bilibili CDN fallback。
+- 所有平台统一最多发送 3 张图片；超过数量时仅发送前 3 张，`+pN` 可明确指定某一页。
 - 超尺寸、超长宽比或不适合 Telegram Photo 的图片会生成合规预览。
 - 回复图片预览发送 `/file`，可以取回对应原图文件。
 - 超大视频会尝试使用 FFmpeg 压缩或降低清晰度。
 - 成功上传的 Telegram `file_id` 和回复媒体映射会写入 SQLite，重复发送可减少重复上传。
-- 长正文会使用 Telegram `expandable` blockquote 自动折叠；正文空间会根据标题、作者和统计信息动态分配，并尽量在段落或空白边界截断。
+- Pixiv 描述会将常见 HTML 标签和实体转换为可读纯文本。
+- 长正文会先展示约 5% 导读，其余内容放入 Telegram `expandable` blockquote；截断优先落在段落或空白边界。
 - 媒体组分批发送时，caption 只附加到最后一批，避免重复显示。
 - 专辑和歌单最多展示前 30 首；直播默认发送信息和封面。
 
@@ -234,7 +236,7 @@ docker run -d \
 ### 下载并启动
 
 ```bash
-VERSION=v0.2.17
+VERSION=v0.2.18
 curl -fLO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz"
 curl -fLO "https://github.com/CongMiaoFactory/congmiao-feedbot/releases/download/${VERSION}/congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
 sha256sum -c "congmiao-feedbot-${VERSION}-linux-x86_64.tar.gz.sha256"
@@ -494,6 +496,7 @@ https://www.pixiv.net/artworks/123456789
 
 - `+sp`：本次强制使用 spoiler，例如 `https://... +sp`。
 - `+p2`：只发送第 2 页或第 2 张媒体，例如 `https://www.pixiv.net/artworks/123456+p2`。
+- 默认每条内容最多发送 3 张图片，适用于 X、Pixiv、Bilibili 及其他平台；`+pN` 明确指定页码时只发送指定媒体。
 - 回复 Bot 的图片预览后发送 `/file`：取回该预览对应的原图文件。
 - 参数可以组合：`https://www.pixiv.net/artworks/123456+p2+sp`。
 - `+pN` 对只提供单个媒体的内容没有额外效果。
@@ -676,7 +679,7 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
-发布工作流文件：`.github/workflows/release.yml`。
+发布工作流文件：`.github/workflows/release.yml`；常规 Rust 检查和 GHCR 镜像构建由 `.github/workflows/ci.yml` 负责，发布标签不会重复执行 Rust 检查。
 
 ## 许可证
 
