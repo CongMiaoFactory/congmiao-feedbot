@@ -1,15 +1,18 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 
 use congmiao_feedbot::{
     Config, ContentKind, MediaItem, MediaKind, ParseOptions, ParseRequest, Platform, Provider,
     ProviderRegistry, RuntimeCredentials,
     cache::AppCache,
     login::{LoginPoll, LoginService},
+    media::MediaProcessor,
     provider::{BilibiliProvider, NeteaseProvider, PixivProvider, XProvider, YouTubeProvider},
     storage::Storage,
+    telegram::BotState,
     telegram::{
         MAX_PHOTOS_PER_CONTENT, caption, caption_with_options, extract_urls, media_group_sizes,
-        media_has_spoiler, select_media_items, strip_url_flags,
+        media_has_spoiler, parse_cached, select_media_items, strip_url_flags,
     },
 };
 use reqwest::Client;
@@ -999,6 +1002,41 @@ async fn sqlite_cache_and_local_rate_limit_work() {
     assert!(cache.allow("u", 2, Duration::from_secs(60)).await);
     assert!(cache.allow("u", 2, Duration::from_secs(60)).await);
     assert!(!cache.allow("u", 2, Duration::from_secs(60)).await);
+}
+
+#[tokio::test]
+async fn parse_cached_deduplicates_inline_style_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/2/status/123456789012"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":200,"status":{"id":"123456789012","url":"https://x.com/a/status/123456789012","text":"hello","possibly_sensitive":false,"likes":1,"author":{"id":"9","name":"Alice","screen_name":"a"},"media":{"photos":[{"type":"photo","url":"https://img.test/a.jpg","width":100,"height":80}],"videos":[]}}}))).mount(&server).await;
+    let mut c = config();
+    c.fxtwitter_api_base = server.uri();
+    let registry =
+        ProviderRegistry::new_with_credentials(&c, RuntimeCredentials::memory(&c)).unwrap();
+    let cache = AppCache::new();
+    let state = BotState {
+        config: c.clone(),
+        registry,
+        media: MediaProcessor::new(Client::new(), &c),
+        storage: Storage::connect("sqlite::memory:").await.unwrap(),
+        cache,
+        login: LoginService::new(&c, RuntimeCredentials::memory(&c)).unwrap(),
+        credentials: RuntimeCredentials::memory(&c),
+        queue: Arc::new(Semaphore::new(c.max_queue_size.max(1))),
+    };
+    let request = ParseRequest {
+        url: "https://x.com/a/status/123456789012".into(),
+        options: ParseOptions::default(),
+    };
+    let first = parse_cached(&state, vec![request.clone()]).await;
+    let second = parse_cached(&state, vec![request]).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let first = first.into_iter().next().unwrap().unwrap();
+    let second = second.into_iter().next().unwrap().unwrap();
+    assert_eq!(first.0.platform, Platform::X);
+    assert_eq!(second.0.platform, Platform::X);
+    assert_eq!(first.0.author.name, "Alice");
+    assert_eq!(second.0.author.name, "Alice");
 }
 
 #[tokio::test]

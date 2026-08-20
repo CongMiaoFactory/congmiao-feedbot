@@ -409,7 +409,7 @@ async fn handle_login(bot: Bot, msg: &Message, state: &BotState, text: &str) -> 
     Ok(())
 }
 
-async fn parse_cached(
+pub async fn parse_cached(
     state: &BotState,
     requests: Vec<ParseRequest>,
 ) -> Vec<ProviderResult<(ParsedContent, ParseOptions)>> {
@@ -1075,9 +1075,8 @@ async fn handle_inline(bot: Bot, query: InlineQuery, state: BotState) -> Respons
         return Ok(());
     };
     let page = request.options.page;
-    let result = state.registry.parse_one(request).await;
-    let results = match result {
-        Ok(mut content) => {
+    let results = match parse_cached(&state, vec![request]).await.into_iter().next() {
+        Some(Ok((mut content, _options))) => {
             if let Some(page) = page {
                 match select_media_items(
                     &content,
@@ -1108,10 +1107,10 @@ async fn handle_inline(bot: Bot, query: InlineQuery, state: BotState) -> Respons
             }
             vec![inline_result(&state, &content).await]
         }
-        Err(err) => vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+        Some(Err(_)) | None => vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
             "error",
             "解析失败",
-            InputMessageContent::Text(InputMessageContentText::new(err.to_string())),
+            InputMessageContent::Text(InputMessageContentText::new("解析失败".to_string())),
         ))],
     };
     bot.answer_inline_query(query.id, results)
