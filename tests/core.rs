@@ -5,7 +5,7 @@ use congmiao_feedbot::{
     ProviderRegistry, RuntimeCredentials,
     cache::AppCache,
     login::{LoginPoll, LoginService},
-    provider::{BilibiliProvider, NeteaseProvider, PixivProvider, XProvider},
+    provider::{BilibiliProvider, NeteaseProvider, PixivProvider, XProvider, YouTubeProvider},
     storage::Storage,
     telegram::{
         MAX_PHOTOS_PER_CONTENT, caption, caption_with_options, extract_urls, media_group_sizes,
@@ -63,6 +63,10 @@ fn registry_routes_all_supported_platforms() {
     let cases = [
         ("https://x.com/user/status/1234567890123456789", Platform::X),
         ("https://youtu.be/dQw4w9WgXcQ", Platform::YouTube),
+        (
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+            Platform::YouTube,
+        ),
         ("https://www.pixiv.net/artworks/123456", Platform::Pixiv),
         (
             "https://www.bilibili.com/video/BV1xx411c7mD",
@@ -1079,4 +1083,54 @@ async fn qr_login_persists_bilibili_and_netease_cookies() {
             .contains("MUSIC_U=music-session")
     );
     assert!(storage.get_credential("netease").await.unwrap().is_some());
+}
+
+#[test]
+fn youtube_provider_handles_music_urls() {
+    let registry = ProviderRegistry::new(&config()).unwrap();
+    let cases = [
+        "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://music.youtube.com/shorts/dQw4w9WgXcQ",
+    ];
+    for url in cases {
+        assert_eq!(registry.find(url).unwrap().platform(), Platform::YouTube);
+    }
+}
+
+#[test]
+fn youtube_provider_detects_audio_only() {
+    let audio_only = serde_json::json!({
+        "ext": "m4a",
+        "vcodec": "none",
+        "acodec": "mp4a",
+        "formats": []
+    });
+    assert!(YouTubeProvider::is_audio_only(&audio_only));
+
+    let video = serde_json::json!({
+        "ext": "mp4",
+        "vcodec": "avc1",
+        "acodec": "mp4a",
+        "formats": []
+    });
+    assert!(!YouTubeProvider::is_audio_only(&video));
+
+    let webm_audio = serde_json::json!({
+        "ext": "webm",
+        "vcodec": "none",
+        "acodec": "opus",
+        "formats": []
+    });
+    assert!(YouTubeProvider::is_audio_only(&webm_audio));
+
+    let mixed_formats = serde_json::json!({
+        "ext": "mp4",
+        "vcodec": "avc1",
+        "acodec": "mp4a",
+        "formats": [
+            {"vcodec": "avc1"},
+            {"vcodec": "none"}
+        ]
+    });
+    assert!(!YouTubeProvider::is_audio_only(&mixed_formats));
 }

@@ -316,8 +316,13 @@ impl MediaProcessor {
             let _ = tokio::fs::remove_file(archive).await;
             conversion?;
         } else if content.platform == crate::model::Platform::YouTube {
-            self.download_youtube(&content.canonical_url, output, quality)
-                .await?;
+            if item.kind == MediaKind::Audio {
+                self.download_youtube_audio(&content.canonical_url, output)
+                    .await?;
+            } else {
+                self.download_youtube(&content.canonical_url, output, quality)
+                    .await?;
+            }
         } else {
             let primary = self.temp_dir.join(format!("{safe}.part1"));
             let primary_download = self
@@ -716,6 +721,25 @@ impl MediaProcessor {
         .arg(url)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+        if let Some(path) = &self.youtube_cookies {
+            cmd.arg("--cookies").arg(path);
+        }
+        let out = cmd.output().await.context("无法启动 yt-dlp")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "yt-dlp: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+    async fn download_youtube_audio(&self, url: &str, target: &Path) -> Result<()> {
+        let mut cmd = Command::new(&self.yt_dlp);
+        cmd.args(["--no-playlist", "--no-warnings", "-f", "bestaudio", "-o"])
+            .arg(target)
+            .arg(url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         if let Some(path) = &self.youtube_cookies {
             cmd.arg("--cookies").arg(path);
         }

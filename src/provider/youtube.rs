@@ -21,7 +21,7 @@ pub struct YouTubeProvider {
 impl YouTubeProvider {
     pub fn new(client: Client, config: &Config) -> Self {
         Self { client, api_key: config.youtube_api_key.clone(), yt_dlp: config.yt_dlp_path.clone(), cookies: config.youtube_cookies_file.clone(),
-            regex: Regex::new(r"(?i)(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s#]*&)?v=|shorts/|live/|embed/))([A-Za-z0-9_-]{11})").expect("valid YouTube regex") }
+            regex: Regex::new(r"(?i)(?:youtu\.be/|(?:music\.)?youtube(?:-nocookie)?\.com/(?:watch\?(?:[^\s#]*&)?v=|shorts/|live/|embed/))([A-Za-z0-9_-]{11})").expect("valid YouTube regex") }
     }
     fn id(&self, url: &str) -> Option<String> {
         self.regex.captures(url).map(|c| c[1].to_string())
@@ -44,8 +44,35 @@ impl YouTubeProvider {
                 String::from_utf8_lossy(&out.stderr).trim().to_string(),
             ));
         }
-        serde_json::from_slice(&out.stdout)
-            .map_err(|e| ProviderError::InvalidResponse(format!("yt-dlp JSON: {e}")))
+        let value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| ProviderError::InvalidResponse(format!("yt-dlp JSON: {e}")))?;
+        Ok(value)
+    }
+
+    pub fn is_audio_only(data: &Value) -> bool {
+        let vcodec = data
+            .get("vcodec")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if vcodec == "none" {
+            return true;
+        }
+        let ext = data.get("ext").and_then(Value::as_str).unwrap_or_default();
+        let audio_exts = ["m4a", "mp3", "opus", "webm", "ogg", "wav", "flac", "aac"];
+        if !audio_exts.contains(&ext) {
+            return false;
+        }
+        data.get("formats")
+            .and_then(Value::as_array)
+            .map(|formats| {
+                !formats.iter().any(|format| {
+                    format
+                        .get("vcodec")
+                        .and_then(Value::as_str)
+                        .is_some_and(|codec| codec != "none")
+                })
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -106,26 +133,63 @@ impl Provider for YouTubeProvider {
             .or_else(|| get_str(y, "/thumbnail"))
             .or_else(|| get_str(&data, "/thumbnail_url"))
             .map(str::to_string);
+        let is_audio_only = ytdlp.as_ref().is_some_and(Self::is_audio_only);
+        let content_kind = if is_audio_only {
+            ContentKind::Audio
+        } else {
+            ContentKind::Video
+        };
+        let media_kind = if is_audio_only {
+            MediaKind::Audio
+        } else {
+            MediaKind::Video
+        };
+        let (filename, mime_type, cache_key) = if is_audio_only {
+            let ext = ytdlp
+                .as_ref()
+                .and_then(|value| value.get("ext").and_then(Value::as_str))
+                .unwrap_or("m4a");
+            let mime = match ext {
+                "mp3" => "audio/mpeg",
+                "ogg" | "opus" => "audio/ogg",
+                "webm" => "audio/webm",
+                "wav" => "audio/wav",
+                "flac" => "audio/flac",
+                "aac" => "audio/aac",
+                _ => "audio/mp4",
+            };
+            (
+                format!("youtube-{id}.{ext}"),
+                Some(mime.to_string()),
+                format!("youtube:{id}:audio"),
+            )
+        } else {
+            (
+                format!("youtube-{id}.mp4"),
+                Some("video/mp4".into()),
+                format!("youtube:{id}:{}p", request.options.quality_or_default()),
+            )
+        };
         let media = vec![MediaItem {
-            kind: MediaKind::Video,
+            kind: media_kind,
             source_url: canonical.clone(),
             fallback_urls: vec![],
             thumbnail_url: thumbnail,
-            filename: format!("youtube-{id}.mp4"),
-            mime_type: Some("video/mp4".into()),
+            filename,
+            mime_type,
             duration_secs: get_u64(y, "/duration"),
             width: get_u64(y, "/width").map(|n| n as u32),
             height: get_u64(y, "/height").map(|n| n as u32),
             size: get_u64(y, "/filesize_approx"),
             headers: Default::default(),
-            cache_key: format!("youtube:{id}:{}p", request.options.quality_or_default()),
+            cache_key,
             requires_download: true,
             secondary_url: None,
             secondary_fallback_urls: vec![],
         }];
         Ok(ParsedContent {
             platform: Platform::YouTube,
-            kind: ContentKind::Video,
+            kind: content_kind,
             id,
             canonical_url: canonical,
             author: Author {
