@@ -1,0 +1,21 @@
+[package]
+name = "feedbot-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Domain models, extractor/auth/media traits, and option parser"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strsim.workspace = true
+thiserror.workspace = true
+time.workspace = true
+url.workspace = true
+uuid.workspace = true
+hex.workspace = true

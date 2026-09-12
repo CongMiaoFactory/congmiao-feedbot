@@ -1,0 +1,63 @@
+[telegram]
+api_url = "https://api.telegram.org"
+admin_ids = []
+mode = "polling"
+
+[telegram.polling]
+timeout_secs = 10
+drop_pending = true
+
+[telegram.webhook]
+addr = "0.0.0.0:8080"
+public_url = ""
+secret_token = ""
+drop_pending = true
+
+[limits]
+extract_permits = 8
+media_permits = 2
+per_user_per_minute = 10
+progress_edit_interval_secs = 3
+max_attempts = 3
+
+[output]
+album_max = 10
+summary_threshold = 20
+max_upload_bytes = 52428800
+max_photo_bytes = 10485760
+overflow = "chunk"
+
+[database]
+path = "data/feedbot.db"
+
+[ffmpeg]
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+
+[ytdlp]
+bin = "yt-dlp"
+
+[http]
+user_agent = "CongMiaoFeedBot/0.1"
+timeout_secs = 30
+connect_timeout_secs = 10
+
+[feed]
+tick_secs = 30
+max_fail_count = 8
+
+[log]
+format = "pretty"
+
+[bilibili]
+passport_base = "https://passport.bilibili.com"
+api_base = "https://api.bilibili.com"
+live_api_base = "https://api.live.bilibili.com"
+
+[netease]
+api_base = "http://127.0.0.1:3000"
+
+[secrets]
+# Leave empty to auto-generate data/master.key on first run.
+# Production: set FEEDBOT__SECRETS__MASTER_KEY instead. Never commit the real key.
+master_key = ""

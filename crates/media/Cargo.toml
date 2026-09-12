@@ -1,0 +1,25 @@
+[package]
+name = "feedbot-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FFmpeg CLI media processor and HTTP downloader"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+feedbot-core.workspace = true
+http.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+zip.workspace = true
+
+[features]
+default = []
+ffmpeg-ffi = []

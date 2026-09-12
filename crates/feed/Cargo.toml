@@ -1,0 +1,18 @@
+[package]
+name = "feedbot-feed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Subscription scheduler that shares the extract/upload worker pool"
+
+[dependencies]
+feedbot-core.workspace = true
+feedbot-extractors.workspace = true
+feedbot-store.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
