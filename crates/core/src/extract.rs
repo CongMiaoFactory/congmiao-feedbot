@@ -2,7 +2,7 @@
 
 use crate::auth::{AuthProvider, Credential};
 use crate::media::Ytdlp;
-use crate::options::{OptionError, OptionSpec, OptionValues};
+use crate::options::{OptionError, OptionSpec, OptionValues, merge_layers};
 use bytes::Bytes;
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -91,12 +91,6 @@ pub enum MediaKind {
     Document,
 }
 
-#[derive(Debug, Clone)]
-pub enum ManifestKind {
-    Hls,
-    Dash,
-}
-
 /// One frame inside a Pixiv ugoira zip, with its display duration.
 #[derive(Debug, Clone)]
 pub struct UgoiraFrame {
@@ -108,11 +102,6 @@ pub struct UgoiraFrame {
 pub enum MediaSource {
     Direct {
         url: Url,
-        headers: HeaderMap,
-    },
-    Segmented {
-        manifest: Url,
-        kind: ManifestKind,
         headers: HeaderMap,
     },
     Separated {
@@ -132,6 +121,14 @@ pub enum MediaSource {
         thumbnail: Option<Url>,
         cookies: Option<String>,
     },
+}
+
+/// One item of a subscribable source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedEntry {
+    /// Stable per-source identity used for de-duplication.
+    pub key: String,
+    pub url: Url,
 }
 
 #[derive(Debug, Error)]
@@ -161,12 +158,50 @@ pub struct HttpRequest {
     pub url: Url,
     pub headers: HeaderMap,
     pub method: HttpMethod,
+    /// Request body; only sent for `Post`.
+    pub body: Bytes,
+    /// When false, a 3xx response is returned as-is instead of being followed.
+    pub follow_redirects: bool,
+}
+
+impl HttpRequest {
+    pub fn get(url: Url, headers: HeaderMap) -> Self {
+        Self {
+            url,
+            headers,
+            method: HttpMethod::Get,
+            body: Bytes::new(),
+            follow_redirects: true,
+        }
+    }
+
+    /// `headers` should carry the body's `Content-Type`.
+    pub fn post(url: Url, headers: HeaderMap, body: impl Into<Bytes>) -> Self {
+        Self {
+            method: HttpMethod::Post,
+            body: body.into(),
+            ..Self::get(url, headers)
+        }
+    }
+
+    pub fn head(url: Url, headers: HeaderMap) -> Self {
+        Self {
+            method: HttpMethod::Head,
+            ..Self::get(url, headers)
+        }
+    }
+
+    pub fn without_redirects(mut self) -> Self {
+        self.follow_redirects = false;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum HttpMethod {
     Get,
     Head,
+    Post,
 }
 
 #[derive(Debug, Clone)]
@@ -194,17 +229,61 @@ impl ExtractCtx {
     }
 }
 
+/// Identity and help text of one site, in one place; command pages read it.
+#[derive(Debug, Clone, Copy)]
+pub struct SiteMeta {
+    /// Stable id stored in jobs, subscriptions, and credentials.
+    pub id: &'static str,
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    /// Higher wins when several sites match one URL.
+    pub priority: i32,
+    /// Extractable work types, e.g. `插画`, `动图 ugoira`.
+    pub kinds: &'static [&'static str],
+    /// Short URL shapes `extract` accepts.
+    pub examples: &'static [&'static str],
+    /// Short URL shapes `/sub` accepts.
+    pub feed_examples: &'static [&'static str],
+}
+
 #[async_trait::async_trait]
 pub trait Extractor: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn display_name(&self) -> &'static str;
+    fn meta(&self) -> SiteMeta;
+
+    fn id(&self) -> &'static str {
+        self.meta().id
+    }
+    fn display_name(&self) -> &'static str {
+        self.meta().name
+    }
     fn aliases(&self) -> &'static [&'static str] {
-        &[]
+        self.meta().aliases
     }
     fn priority(&self) -> i32 {
-        0
+        self.meta().priority
     }
+    fn extract_kinds(&self) -> &'static [&'static str] {
+        self.meta().kinds
+    }
+    fn url_examples(&self) -> &'static [&'static str] {
+        self.meta().examples
+    }
+    fn feed_examples(&self) -> &'static [&'static str] {
+        self.meta().feed_examples
+    }
+
     fn matches(&self, url: &Url) -> bool;
+
+    /// Canonical form of a URL this site owns (host aliases, offline-known
+    /// short links); `None` when the URL is not this site's.
+    fn rewrite_url(&self, _url: &Url) -> Option<Url> {
+        None
+    }
+
+    /// Caption layout of this site's results.
+    fn present(&self) -> crate::present::Present {
+        crate::present::Present::Default
+    }
 
     fn options(&self) -> &'static OptionSpec {
         &OptionSpec::EMPTY
@@ -212,18 +291,40 @@ pub trait Extractor: Send + Sync {
     fn validate(&self, _opts: &mut OptionValues) -> Result<(), OptionError> {
         Ok(())
     }
+
+    /// Options of one request: spec defaults < `saved` chat/user layers <
+    /// inline `tokens`, then [`Extractor::validate`].
+    fn resolve_options(
+        &self,
+        saved: &OptionValues,
+        tokens: &[String],
+    ) -> Result<OptionValues, OptionError> {
+        let mut options = merge_layers(self.options(), saved, tokens)?;
+        self.validate(&mut options)?;
+        Ok(options)
+    }
     fn auth(&self) -> Option<&dyn AuthProvider> {
         None
     }
 
-    /// Human-readable extractable work types, e.g. `插画`, `动图 ugoira`.
-    fn extract_kinds(&self) -> &'static [&'static str] {
-        &[]
+    /// Whether `url` names a subscribable source (user page, channel, playlist…).
+    fn feed_matches(&self, _url: &Url) -> bool {
+        false
     }
 
-    /// Short URL shapes this extractor accepts.
-    fn url_examples(&self) -> &'static [&'static str] {
-        &[]
+    /// Whether `feed` needs a stored credential; `/sub` refuses without one.
+    fn feed_requires_login(&self) -> bool {
+        false
+    }
+
+    /// Latest entries of a subscribable source, newest first. Every entry URL
+    /// must be extractable by this extractor.
+    async fn feed(
+        &self,
+        _ctx: &ExtractCtx,
+        _req: &ExtractRequest,
+    ) -> Result<Vec<FeedEntry>, ExtractError> {
+        Err(ExtractError::Unsupported)
     }
 
     async fn extract(
@@ -231,6 +332,12 @@ pub trait Extractor: Send + Sync {
         ctx: &ExtractCtx,
         req: &ExtractRequest,
     ) -> Result<Extracted, ExtractError>;
+}
+
+/// Exact lookup of an extractor by its stable [`Extractor::id`], as stored in
+/// jobs, subscriptions, and credentials. No alias or fuzzy matching.
+pub trait ExtractorLookup: Send + Sync {
+    fn by_id(&self, id: &str) -> Option<Arc<dyn Extractor>>;
 }
 
 /// Chat/user/global credential lookup scope.

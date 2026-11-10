@@ -1,0 +1,21 @@
+[package]
+name = "feedbot-site-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Helpers and test fakes shared by the site crates"
+
+[features]
+# Fakes for whole `extract` / `feed` runs in other crates' tests.
+testing = []
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+feedbot-core.workspace = true
+http.workspace = true
+image.workspace = true
+qrcode.workspace = true
+serde_json.workspace = true
+url.workspace = true

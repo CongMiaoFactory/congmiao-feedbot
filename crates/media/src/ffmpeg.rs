@@ -1,17 +1,21 @@
 use feedbot_core::{MediaError, MediaInfo, MediaProcessor, TranscodeSpec, UgoiraFrame};
 use serde::Deserialize;
 use std::fs::File;
-use std::io::{copy, Write};
+use std::io::{Write, copy};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 use zip::ZipArchive;
 
+/// Default wall-clock limit for one ffmpeg/ffprobe invocation.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Clone)]
 pub struct FfmpegCli {
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
+    timeout: Duration,
 }
 
 impl FfmpegCli {
@@ -19,17 +23,28 @@ impl FfmpegCli {
         Self {
             ffmpeg: ffmpeg.into(),
             ffprobe: ffprobe.into(),
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 
-    async fn run(bin: &Path, args: &[&str]) -> Result<String, MediaError> {
-        let output = Command::new(bin)
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.timeout = timeout;
+        }
+        self
+    }
+
+    async fn run(&self, bin: &Path, args: &[&str]) -> Result<String, MediaError> {
+        let child = Command::new(bin)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(self.timeout, child)
             .await
+            .map_err(|_| MediaError::Ffmpeg(format!("超时（{} 秒）", self.timeout.as_secs())))?
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     MediaError::MissingBinary
@@ -123,19 +138,20 @@ struct ProbeStream {
 impl MediaProcessor for FfmpegCli {
     async fn probe(&self, path: &Path) -> Result<MediaInfo, MediaError> {
         let path_str = path.to_string_lossy();
-        let json = Self::run(
-            &self.ffprobe,
-            &[
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_format",
-                "-show_streams",
-                path_str.as_ref(),
-            ],
-        )
-        .await?;
+        let json = self
+            .run(
+                &self.ffprobe,
+                &[
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_format",
+                    "-show_streams",
+                    path_str.as_ref(),
+                ],
+            )
+            .await?;
         let parsed: ProbeJson =
             serde_json::from_str(&json).map_err(|e| MediaError::Ffmpeg(e.to_string()))?;
         let mut info = MediaInfo {
@@ -196,14 +212,14 @@ impl MediaProcessor for FfmpegCli {
             out.into_owned(),
         ]);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        Self::run(&self.ffmpeg, &arg_refs).await?;
+        self.run(&self.ffmpeg, &arg_refs).await?;
         Ok(())
     }
 
     async fn thumbnail(&self, input: &Path, output: &Path) -> Result<(), MediaError> {
         let inp = input.to_string_lossy();
         let out = output.to_string_lossy();
-        Self::run(
+        self.run(
             &self.ffmpeg,
             &[
                 "-ss",
@@ -233,7 +249,7 @@ impl MediaProcessor for FfmpegCli {
         let inp = input.to_string_lossy();
         let out = output.to_string_lossy();
         let vf = format!("scale=-2:'min({},ih)'", spec.max_height);
-        Self::run(
+        self.run(
             &self.ffmpeg,
             &[
                 "-i",
@@ -283,11 +299,11 @@ impl MediaProcessor for FfmpegCli {
 
         let list = list_path.to_string_lossy().into_owned();
         let out = output.to_string_lossy().into_owned();
-        match encode_ugoira(&self.ffmpeg, &list, &out, true).await {
+        match encode_ugoira(self, &list, &out, true).await {
             Err(MediaError::Ffmpeg(msg))
                 if msg.to_ascii_lowercase().contains("unrecognized option") =>
             {
-                encode_ugoira(&self.ffmpeg, &list, &out, false).await
+                encode_ugoira(self, &list, &out, false).await
             }
             other => other,
         }
@@ -295,14 +311,14 @@ impl MediaProcessor for FfmpegCli {
 }
 
 async fn encode_ugoira(
-    bin: &Path,
+    cli: &FfmpegCli,
     list: &str,
     output: &str,
     fps_mode: bool,
 ) -> Result<(), MediaError> {
     let timing = if fps_mode { "-fps_mode" } else { "-vsync" };
-    FfmpegCli::run(
-        bin,
+    cli.run(
+        &cli.ffmpeg,
         &[
             "-f",
             "concat",

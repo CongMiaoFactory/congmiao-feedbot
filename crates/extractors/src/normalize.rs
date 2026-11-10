@@ -1,5 +1,8 @@
-//! URL canonicalization: host aliases, tracking-query strip, lowercase host.
+//! URL canonicalization: lowercase host, the owning site's rewrite
+//! ([`Extractor::rewrite_url`]), tracking-query strip.
 
+use feedbot_core::Extractor;
+use std::sync::Arc;
 use url::Url;
 
 const TRACKING_PREFIXES: &[&str] = &[
@@ -15,54 +18,18 @@ const TRACKING_PREFIXES: &[&str] = &[
     "si",
 ];
 
-pub fn canonicalize(url: &Url) -> Url {
+/// Use [`crate::ExtractorRegistry::canonicalize`]; this takes the extractors
+/// so sites keep their own host rules.
+pub(crate) fn canonicalize(url: &Url, extractors: &[Arc<dyn Extractor>]) -> Url {
     let mut url = url.clone();
     if let Some(host) = url.host_str().map(|h| h.to_ascii_lowercase()) {
-        if matches!(host.as_str(), "youtu.be" | "www.youtu.be") {
-            rewrite_youtu_be(&mut url);
-        } else {
-            let mapped = match host.as_str() {
-                "x.com" | "mobile.twitter.com" | "m.twitter.com" | "www.twitter.com" => {
-                    "twitter.com"
-                }
-                "m.bilibili.com" | "www.bilibili.com" => "bilibili.com",
-                "www.youtube.com" | "m.youtube.com" => "youtube.com",
-                "www.music.youtube.com" => "music.youtube.com",
-                "www.pixiv.net" => "pixiv.net",
-                other => other,
-            };
-            let _ = url.set_host(Some(mapped));
-        }
+        let _ = url.set_host(Some(&host));
+    }
+    if let Some(next) = extractors.iter().find_map(|e| e.rewrite_url(&url)) {
+        url = next;
     }
     strip_tracking(&mut url);
     url
-}
-
-fn rewrite_youtu_be(url: &mut Url) {
-    let id = url
-        .path_segments()
-        .and_then(|mut s| s.next())
-        .unwrap_or("")
-        .to_string();
-    let extra: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(k, _)| k != "v")
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    let _ = url.set_host(Some("youtube.com"));
-    url.set_path("/watch");
-    let mut q = format!("v={id}");
-    for (k, v) in extra {
-        q.push('&');
-        q.push_str(&k);
-        q.push('=');
-        q.push_str(&v);
-    }
-    if id.is_empty() {
-        url.set_query(None);
-    } else {
-        url.set_query(Some(&q));
-    }
 }
 
 fn strip_tracking(url: &mut Url) {
@@ -79,12 +46,11 @@ fn strip_tracking(url: &mut Url) {
     if pairs.is_empty() {
         url.set_query(None);
     } else {
-        let encoded = pairs
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        url.set_query(Some(&encoded));
+        // Re-encode: the pairs above are decoded, so `a%26b` must not come
+        // back as a bare `a&b`.
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.extend_pairs(&pairs);
+        url.set_query(Some(&query.finish()));
     }
 }
 
@@ -92,37 +58,39 @@ fn strip_tracking(url: &mut Url) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn maps_x_and_strips_utm() {
-        let u = Url::parse("https://x.com/foo/status/1?utm_source=t&utm_medium=c").unwrap();
-        let c = canonicalize(&u);
-        assert_eq!(c.host_str(), Some("twitter.com"));
-        assert!(c.query().is_none());
+    fn pairs(url: &Url) -> Vec<(String, String)> {
+        url.query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    fn p(k: &str, v: &str) -> (String, String) {
+        (k.into(), v.into())
     }
 
     #[test]
-    fn keeps_music_host_and_rewrites_youtu_be() {
-        let music =
-            canonicalize(&Url::parse("https://music.youtube.com/watch?v=abc&si=xx").unwrap());
-        assert_eq!(music.host_str(), Some("music.youtube.com"));
-        assert_eq!(
-            music
-                .query_pairs()
-                .find(|(k, _)| k == "v")
-                .map(|(_, v)| v.into_owned()),
-            Some("abc".into())
+    fn strips_tracking_and_lowercases_host() {
+        let c = canonicalize(
+            &Url::parse("https://Example.COM/a?utm_source=t&z=1&si=x").unwrap(),
+            &[],
         );
-        assert!(music.query_pairs().all(|(k, _)| k != "si"));
+        assert_eq!(c.host_str(), Some("example.com"));
+        assert_eq!(pairs(&c), [p("z", "1")]);
+        let bare = canonicalize(
+            &Url::parse("https://example.com/a?utm_medium=c").unwrap(),
+            &[],
+        );
+        assert!(bare.query().is_none());
+    }
 
-        let short = canonicalize(&Url::parse("https://youtu.be/abc123?si=1").unwrap());
-        assert_eq!(short.host_str(), Some("youtube.com"));
-        assert_eq!(short.path(), "/watch");
-        assert_eq!(
-            short
-                .query_pairs()
-                .find(|(k, _)| k == "v")
-                .map(|(_, v)| v.into_owned()),
-            Some("abc123".into())
+    #[test]
+    fn keeps_encoded_query_values() {
+        let c = canonicalize(
+            &Url::parse("https://example.com/a?q=a%26b&z=1").unwrap(),
+            &[],
         );
+        assert_eq!(pairs(&c), [p("q", "a&b"), p("z", "1")]);
+        let plus = canonicalize(&Url::parse("https://example.com/a?q=a+b").unwrap(), &[]);
+        assert_eq!(pairs(&plus), [p("q", "a b")]);
     }
 }

@@ -1,4 +1,4 @@
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use feedbot_core::StoreError;
 use rand::RngCore;
@@ -28,24 +28,45 @@ impl SecretBox {
         })
     }
 
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
+    /// Encrypt `plaintext` bound to `aad`, so a ciphertext copied to another
+    /// row (different owner/platform) fails to decrypt.
+    pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = self
             .cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|e| StoreError::Crypto(e.to_string()))?;
         Ok((nonce_bytes.to_vec(), ciphertext))
     }
 
-    pub fn decrypt(&self, nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, StoreError> {
+    /// Decrypt with `aad`, falling back to rows written before AAD binding.
+    pub fn decrypt(
+        &self,
+        nonce: &[u8],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, StoreError> {
         if nonce.len() != 12 {
             return Err(StoreError::Crypto("nonce 长度错误".into()));
         }
         let nonce = Nonce::from_slice(nonce);
         self.cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .or_else(|_| self.cipher.decrypt(nonce, ciphertext))
             .map_err(|e| StoreError::Crypto(e.to_string()))
     }
 }

@@ -1,20 +1,23 @@
 use crate::app::{App, TgBot};
 use crate::ui::{self, UiCallback};
+use feedbot_core::Scope;
 use feedbot_core::auth::{
     AuthChallenge, AuthError, AuthInput, AuthMethod, AuthProgress, AuthSession, Credential,
 };
-use feedbot_core::{CredentialRepo, Scope};
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::payloads::{SendMessageSetters, SendPhotoSetters};
 use teloxide::prelude::*;
 use teloxide::types::{ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InputFile};
+use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 pub type LoginDialogue = Dialogue<LoginState, InMemStorage<LoginState>>;
 
 const QR_POLL_MAX: u32 = 65;
+/// Consecutive poll errors after which a QR login is abandoned.
+const QR_POLL_MAX_ERRORS: u32 = 5;
 
 #[derive(Clone, Default, Debug)]
 pub enum LoginState {
@@ -29,18 +32,44 @@ pub enum LoginState {
     },
 }
 
+/// `/login` / `/logout` arguments: platform name plus an optional `global`
+/// keyword (operators only) that targets the shared credential.
+pub fn parse_target(args: &str) -> (String, bool) {
+    let mut global = false;
+    let mut name = String::new();
+    for token in args.split_whitespace() {
+        if token.eq_ignore_ascii_case("global") {
+            global = true;
+        } else if name.is_empty() {
+            name = token.to_string();
+        }
+    }
+    (name, global)
+}
+
+/// Start a login. Any login already running in this dialogue is aborted first
+/// so its QR poller cannot save a credential afterwards.
 pub async fn begin(
     bot: &TgBot,
     msg: &Message,
     app: Arc<App>,
     dialogue: LoginDialogue,
     name: String,
+    global: bool,
 ) -> anyhow::Result<()> {
+    abort(&dialogue).await;
     if !matches!(msg.chat.kind, ChatKind::Private(_)) {
         bot.send_message(msg.chat.id, "请私聊使用 /login").await?;
         return Ok(());
     }
     if name.trim().is_empty() {
+        return Ok(());
+    }
+    // The chat is private here, so the chat id is the user id.
+    let user_id = msg.chat.id.0;
+    if global && !app.is_admin(user_id) {
+        bot.send_message(msg.chat.id, "只有管理员能写入全局凭据")
+            .await?;
         return Ok(());
     }
     let Some(ext) = app.registry.resolve_name(&name) else {
@@ -64,13 +93,6 @@ pub async fn begin(
             .await?;
         return Ok(());
     };
-    let global = msg.text().is_some_and(|t| t.contains("global"))
-        && app.is_admin(msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0));
-    if msg.text().is_some_and(|t| t.contains("global")) && !global {
-        bot.send_message(msg.chat.id, "只有管理员能写入全局凭据")
-            .await?;
-        return Ok(());
-    }
     let mut session = AuthSession {
         extractor_id: ext.id().into(),
         method: Some(method),
@@ -100,7 +122,6 @@ pub async fn begin(
         let app = app.clone();
         let dialogue = dialogue.clone();
         let extractor_id = ext.id().to_string();
-        let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
         tokio::spawn(async move {
             poll_qr(
                 bot,
@@ -197,7 +218,7 @@ pub async fn on_text(
     if secret {
         let _ = bot.delete_message(msg.chat.id, msg.id).await;
     }
-    let Some(ext) = app.registry.resolve_name(&extractor_id) else {
+    let Some(ext) = app.registry.by_id(&extractor_id) else {
         cancel.cancel();
         dialogue.update(LoginState::Idle).await.ok();
         return Ok(());
@@ -223,7 +244,6 @@ pub async fn on_text(
                 .ok();
         }
         Ok(AuthProgress::Completed(cred)) => {
-            let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
             finish_login(
                 &bot,
                 msg.chat.id,
@@ -231,7 +251,7 @@ pub async fn on_text(
                 &dialogue,
                 &extractor_id,
                 global,
-                user_id,
+                msg.chat.id.0,
                 cred,
                 secret,
             )
@@ -267,31 +287,40 @@ async fn poll_qr(
     } else {
         interval
     };
+    let mut last_hint = None;
+    let mut errors = 0;
     for _ in 0..QR_POLL_MAX {
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(interval) => {}
         }
-        if cancel.is_cancelled() {
-            return;
-        }
-        let Some(ext) = app.registry.resolve_name(&extractor_id) else {
+        let Some(ext) = app.registry.by_id(&extractor_id) else {
             break;
         };
         let Some(auth) = ext.auth() else {
             break;
         };
-        match auth.advance(&mut session, AuthInput::Poll).await {
-            Ok(AuthProgress::Pending) => {}
+        let progress = auth.advance(&mut session, AuthInput::Poll).await;
+        // A newer login or /cancel owns the dialogue now; drop this result.
+        if cancel.is_cancelled() {
+            return;
+        }
+        if progress.is_ok() {
+            errors = 0;
+        }
+        match progress {
+            Ok(AuthProgress::Pending | AuthProgress::Continue(AuthChallenge::ShowQr { .. })) => {}
             Ok(AuthProgress::Hint(text)) => {
-                let _ = bot.send_message(chat, text).await;
+                if last_hint.as_ref() != Some(&text) {
+                    let _ = bot.send_message(chat, &text).await;
+                    last_hint = Some(text);
+                }
             }
-            Ok(AuthProgress::Continue(AuthChallenge::ShowQr { .. })) => {}
             Ok(AuthProgress::Continue(ch)) => {
                 let _ = render_challenge(&bot, chat, &ch).await;
             }
             Ok(AuthProgress::Completed(cred)) => {
-                let _ = finish_login(
+                if let Err(e) = finish_login(
                     &bot,
                     chat,
                     &app,
@@ -302,33 +331,57 @@ async fn poll_qr(
                     cred,
                     false,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(error = %e, "failed to save QR login");
+                    let _ = bot.send_message(chat, format!("保存登录态失败：{e}")).await;
+                }
                 return;
             }
             Err(AuthError::SessionExpired) => {
-                dialogue.update(LoginState::Idle).await.ok();
-                let _ = bot
-                    .send_message(chat, "二维码已过期，请重新 /login。")
-                    .await;
+                finish_with(
+                    &bot,
+                    chat,
+                    &dialogue,
+                    &cancel,
+                    "二维码已过期，请重新 /login。",
+                )
+                .await;
                 return;
             }
             Err(e) => {
-                let _ = bot
-                    .send_message(
-                        chat,
-                        format!("{e}\n可继续等待扫码，或点「取消登录」/ 发送「取消」退出。"),
-                    )
-                    .await;
+                errors += 1;
+                tracing::warn!(errors, error = %e, "QR poll failed");
+                // Report the first failure only; give up after a few in a row.
+                if errors >= QR_POLL_MAX_ERRORS {
+                    let text = format!("多次查询扫码状态失败，已退出登录：{e}");
+                    finish_with(&bot, chat, &dialogue, &cancel, &text).await;
+                    return;
+                }
+                if errors == 1 {
+                    let _ = bot
+                        .send_message(chat, format!("查询扫码状态失败：{e}\n会继续重试。"))
+                        .await;
+                }
             }
         }
     }
-    if cancel.is_cancelled() {
-        return;
+    if !cancel.is_cancelled() {
+        finish_with(&bot, chat, &dialogue, &cancel, "扫码超时，请重新 /login。").await;
     }
+}
+
+/// End a QR login this poller still owns and tell the user why.
+async fn finish_with(
+    bot: &TgBot,
+    chat: ChatId,
+    dialogue: &LoginDialogue,
+    cancel: &CancellationToken,
+    text: &str,
+) {
+    cancel.cancel();
     dialogue.update(LoginState::Idle).await.ok();
-    let _ = bot
-        .send_message(chat, "扫码超时，请重新 /login。")
-        .await;
+    let _ = bot.send_message(chat, text).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -349,6 +402,14 @@ async fn finish_login(
         (Scope::User, user_id)
     };
     app.store.save(scope, scope_id, &cred).await?;
+    let resumed = app
+        .store
+        .resume_after_login(
+            extractor_id,
+            (!global).then_some(user_id),
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
     if let Some(LoginState::InProgress { cancel, .. }) = dialogue.get().await.ok().flatten() {
         cancel.cancel();
     }
@@ -360,10 +421,15 @@ async fn finish_login(
     };
     let name = app
         .registry
-        .resolve_name(extractor_id)
+        .by_id(extractor_id)
         .map(|e| e.display_name().to_string())
         .unwrap_or_else(|| extractor_id.to_string());
-    bot.send_message(chat, format!("已保存 {name} 登录态。{extra}"))
+    let resumed = if resumed > 0 {
+        format!("已恢复 {resumed} 个暂停的订阅。")
+    } else {
+        String::new()
+    };
+    bot.send_message(chat, format!("已保存 {name} 登录态。{resumed}{extra}"))
         .await?;
     Ok(())
 }
@@ -407,6 +473,15 @@ async fn render_challenge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_global_keyword_anywhere() {
+        assert_eq!(parse_target("pixiv"), ("pixiv".into(), false));
+        assert_eq!(parse_target("pixiv global"), ("pixiv".into(), true));
+        assert_eq!(parse_target("GLOBAL x"), ("x".into(), true));
+        // Platform names merely containing the word are not the keyword.
+        assert_eq!(parse_target("globalsite"), ("globalsite".into(), false));
+    }
 
     #[test]
     fn abort_text_matches_cancel_words() {

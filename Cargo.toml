@@ -8,13 +8,14 @@ members = [
     "crates/store",
     "crates/bot",
     "crates/feed",
+    "crates/sites/*",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
-rust-version = "1.80"
+rust-version = "1.90"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -24,11 +25,13 @@ bytes = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 config = { version = "0.15", default-features = false, features = ["toml"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 governor = "0.8"
 hex = "0.4"
 http = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 indexmap = { version = "2", features = ["serde"] }
+md5 = { package = "md-5", version = "0.10" }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "json", "cookies", "stream"] }
@@ -50,7 +53,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 teloxide = { version = "0.17", default-features = false, features = [
     "rustls",
-    "ctrlc_handler",
     "throttle",
     "cache-me",
     "macros",
@@ -64,11 +66,18 @@ feedbot-media = { path = "crates/media" }
 feedbot-store = { path = "crates/store" }
 feedbot-bot = { path = "crates/bot" }
 feedbot-feed = { path = "crates/feed" }
+feedbot-site-common = { path = "crates/sites/common" }
+feedbot-bilibili = { path = "crates/sites/bilibili" }
+feedbot-netease = { path = "crates/sites/netease" }
+feedbot-pixiv = { path = "crates/sites/pixiv" }
+feedbot-x = { path = "crates/sites/x" }
+feedbot-youtube = { path = "crates/sites/youtube" }
 
 [package]
 name = "feedbot"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Telegram bot that extracts media from website links and pushes subscribed feeds"
 

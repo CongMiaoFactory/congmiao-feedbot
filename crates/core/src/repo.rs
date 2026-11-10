@@ -1,8 +1,8 @@
 //! Repository traits. Storage crate implements these; core stays backend-agnostic.
 
-use crate::auth::{AuthMethod, Credential};
+use crate::auth::{AuthMethod, Credential, CredentialStatus};
 use crate::extract::Scope;
-use crate::job::{ChatSettings, Job, JobState, MediaCacheEntry, Subscription};
+use crate::job::{Job, JobState, MediaCacheEntry, Subscription};
 use crate::options::OptionValues;
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -21,22 +21,36 @@ pub enum StoreError {
 #[async_trait]
 pub trait JobRepo: Send + Sync {
     async fn insert_job(&self, job: &Job) -> Result<(), StoreError>;
+    /// Move a job to `state`. Returns `false` when the job is already terminal
+    /// (done/failed/cancelled), so callers can stop working on it.
     async fn set_state(
         &self,
         id: Uuid,
         state: JobState,
         last_error: Option<&str>,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
     async fn bump_attempt(&self, id: Uuid) -> Result<(), StoreError>;
     async fn unfinished(&self) -> Result<Vec<Job>, StoreError>;
-    async fn get_job(&self, id: Uuid) -> Result<Option<Job>, StoreError>;
-    async fn cancel_queued_for_user(&self, user_id: i64) -> Result<u64, StoreError>;
+    /// Move every non-terminal job of `user_id` to `cancelled`.
+    async fn cancel_for_user(&self, user_id: i64) -> Result<u64, StoreError>;
+    /// Delete terminal jobs created before `before`.
+    async fn prune_finished(&self, before: OffsetDateTime) -> Result<u64, StoreError>;
 }
 
 #[async_trait]
 pub trait MediaCacheRepo: Send + Sync {
     async fn get_cache_all(&self, source_key: &str) -> Result<Vec<MediaCacheEntry>, StoreError>;
     async fn put_many(&self, entries: &[MediaCacheEntry]) -> Result<(), StoreError>;
+    /// Page published for `source_key` instead of albums (Telegraph).
+    async fn get_page(&self, source_key: &str) -> Result<Option<CachedPage>, StoreError>;
+    async fn put_page(&self, source_key: &str, page: &CachedPage) -> Result<(), StoreError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedPage {
+    pub url: String,
+    /// Item count when published; a different count means the post changed.
+    pub items: i64,
 }
 
 #[async_trait]
@@ -51,6 +65,16 @@ pub trait SubscriptionRepo: Send + Sync {
         fail_count: i32,
         enabled: bool,
     ) -> Result<(), StoreError>;
+    /// Pause a subscription until a login is saved; `false` if it already was.
+    async fn pause_for_login(&self, id: Uuid) -> Result<bool, StoreError>;
+    /// Resume subscriptions paused for `extractor_id` and make them due now.
+    /// `user_id: None` (a global login) resumes them for every user.
+    async fn resume_after_login(
+        &self,
+        extractor_id: &str,
+        user_id: Option<i64>,
+        now: OffsetDateTime,
+    ) -> Result<u64, StoreError>;
     async fn list_for_chat(&self, chat_id: i64) -> Result<Vec<Subscription>, StoreError>;
     async fn delete_subscription(&self, id: Uuid, chat_id: i64) -> Result<bool, StoreError>;
 }
@@ -62,11 +86,12 @@ pub trait SeenRepo: Send + Sync {
         subscription_id: Uuid,
         item_key: &str,
     ) -> Result<bool, StoreError>;
+    /// Undo `insert_if_new`, e.g. when the item could not be enqueued.
+    async fn forget_seen(&self, subscription_id: Uuid, item_key: &str) -> Result<(), StoreError>;
 }
 
 #[async_trait]
 pub trait SettingsRepo: Send + Sync {
-    async fn chat(&self, chat_id: i64) -> Result<ChatSettings, StoreError>;
     async fn get_platform(
         &self,
         scope: Scope,
@@ -89,7 +114,7 @@ pub struct StoredCredentialMeta {
     pub scope_id: i64,
     pub method: AuthMethod,
     pub expires_at: Option<OffsetDateTime>,
-    pub status: String,
+    pub status: CredentialStatus,
 }
 
 #[async_trait]
@@ -100,12 +125,11 @@ pub trait CredentialRepo: Send + Sync {
         scope_id: i64,
         credential: &Credential,
     ) -> Result<(), StoreError>;
-    /// Lookup in user → chat → global order.
+    /// The user's own credential, falling back to the global one.
     async fn resolve(
         &self,
         extractor_id: &str,
         user_id: i64,
-        chat_id: i64,
     ) -> Result<Option<Credential>, StoreError>;
     async fn delete_credential(
         &self,
@@ -114,13 +138,17 @@ pub trait CredentialRepo: Send + Sync {
         scope_id: i64,
     ) -> Result<bool, StoreError>;
     async fn list_for_user(&self, user_id: i64) -> Result<Vec<StoredCredentialMeta>, StoreError>;
-    async fn all(&self) -> Result<Vec<(StoredCredentialMeta, Credential)>, StoreError>;
+    /// Credentials that do not need a new login and were last checked before `before`.
+    async fn due_for_check(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<(StoredCredentialMeta, Credential)>, StoreError>;
     async fn update_status(
         &self,
         extractor_id: &str,
         scope: Scope,
         scope_id: i64,
-        status: &str,
+        status: CredentialStatus,
         credential: Option<&Credential>,
     ) -> Result<(), StoreError>;
 }

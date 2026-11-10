@@ -122,7 +122,7 @@ impl OptionKind {
             Self::Int { min, max } => format!("+{name}:<{min}-{max}>"),
             Self::Str { .. } => format!("+{name}:<text>"),
             Self::Enum { variants } => format!("+{name}:{}", variants.join("|")),
-            Self::IntRange { min, max } => format!("+{name}:{min}-{max}"),
+            Self::IntRange { min, max } => format!("+{name}:<n> / +{name}:{min}-{max}"),
             Self::List { of, .. } => format!("+{name}:a,b  ({})", of.help_hint(name)),
         }
     }
@@ -448,19 +448,20 @@ fn parse_value(kind: &OptionKind, raw: &str) -> Result<OptionValue, OptionError>
     }
 }
 
+/// `a-b`, or a single `n` meaning `n-n`.
 fn parse_range(raw: &str) -> Result<(i64, i64), OptionError> {
-    let Some((a, b)) = raw.split_once('-') else {
-        return Err(OptionError::Invalid(format!(
-            "`{raw}` 不是区间，例如 `1-5`"
-        )));
+    let int = |s: &str| {
+        s.trim()
+            .parse::<i64>()
+            .map_err(|_| OptionError::Invalid(format!("`{s}` 不是整数或区间，例如 `3` 或 `1-5`")))
     };
-    let start: i64 = a
-        .parse()
-        .map_err(|_| OptionError::Invalid(format!("`{a}` 不是整数")))?;
-    let end: i64 = b
-        .parse()
-        .map_err(|_| OptionError::Invalid(format!("`{b}` 不是整数")))?;
-    Ok((start, end))
+    match raw.split_once('-') {
+        Some((a, b)) => Ok((int(a)?, int(b)?)),
+        None => {
+            let n = int(raw)?;
+            Ok((n, n))
+        }
+    }
 }
 
 fn unknown(spec: &OptionSpec, token: &str) -> OptionError {
@@ -519,10 +520,10 @@ pub fn apply_actions(
             }
             Action::Clear { name } => {
                 out.remove(name);
-                if let Some(def) = spec.get(name) {
-                    if let Some(default) = def.default {
-                        out.insert(name, default.to_value());
-                    }
+                if let Some(def) = spec.get(name)
+                    && let Some(default) = def.default
+                {
+                    out.insert(name, default.to_value());
                 }
             }
             Action::ListAdd { name, items } => match out.inner.get_mut(name) {
@@ -543,6 +544,37 @@ pub fn apply_actions(
         }
     }
     out
+}
+
+/// Apply `/set` tokens to one stored layer (chat or user) without baking spec
+/// defaults or other layers into it. `effective` is the merged view the caller
+/// currently sees: list edits start from it so `-tag:a` removes from an
+/// inherited list. Clearing a scalar drops the key so lower layers apply again.
+pub fn apply_to_layer(
+    spec: &OptionSpec,
+    layer: &OptionValues,
+    effective: &OptionValues,
+    inline_tokens: &[String],
+) -> Result<OptionValues, OptionError> {
+    let parsed = parse_tokens(spec, inline_tokens)?;
+    let mut out = layer.clone();
+    for token in &parsed {
+        match &token.action {
+            Action::Set { name, value } => out.insert(name, value.clone()),
+            Action::Clear { name } => {
+                out.remove(name);
+            }
+            Action::ListAdd { name, .. } | Action::ListRemove { name, .. } => {
+                if out.get(name).is_none()
+                    && let Some(inherited) = effective.get(name)
+                {
+                    out.insert(name, inherited.clone());
+                }
+                out = apply_actions(spec, &out, std::slice::from_ref(token));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Three-layer merge: spec defaults < saved settings < inline message tokens.
@@ -655,6 +687,19 @@ mod tests {
                 OptionValue::Int(5),
             ]))
         );
+    }
+
+    #[test]
+    fn range_accepts_single_number() {
+        let v = parse_merge("+r:3", &OptionValues::new());
+        assert_eq!(
+            v.get("r"),
+            Some(&OptionValue::IntRange { start: 3, end: 3 })
+        );
+        let err = |raw: &str| merge_layers(&SPEC, &OptionValues::new(), &[raw.into()]).unwrap_err();
+        assert!(err("+r:x").to_string().contains("不是整数或区间"));
+        assert!(err("+r:21").to_string().contains("不在 1-20 内"));
+        assert!(err("+r:5-2").to_string().contains("不在 1-20 内"));
     }
 
     #[test]

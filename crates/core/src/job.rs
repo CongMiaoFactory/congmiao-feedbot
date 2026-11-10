@@ -1,7 +1,6 @@
 //! Job, subscription, cache, and chat setting domain types.
 
 use crate::extract::MediaKind;
-use crate::options::OptionValues;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use url::Url;
@@ -17,6 +16,8 @@ pub enum JobState {
     Uploading,
     Done,
     Failed,
+    /// Stopped by the user (`/cancel`).
+    Cancelled,
 }
 
 impl JobState {
@@ -29,7 +30,12 @@ impl JobState {
             Self::Uploading => "uploading",
             Self::Done => "done",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -41,6 +47,7 @@ impl JobState {
             "uploading" => Self::Uploading,
             "done" => Self::Done,
             "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
             _ => return None,
         })
     }
@@ -53,7 +60,8 @@ pub struct Job {
     pub user_id: i64,
     pub message_id: i32,
     pub url: Url,
-    pub options: OptionValues,
+    /// Inline `+`/`-` option text sent with the link, re-parsed on every run.
+    pub raw_args: String,
     pub state: JobState,
     pub attempts: i32,
     pub last_error: Option<String>,
@@ -77,18 +85,16 @@ pub struct Subscription {
     pub user_id: i64,
     pub extractor_id: String,
     pub source_ref: String,
-    pub options: OptionValues,
+    /// Inline `+`/`-` option text given to `/sub`, applied to every pushed item
+    /// the same way as text sent next to a link.
+    pub raw_args: String,
     pub cursor: Option<String>,
     pub interval_secs: i64,
     pub enabled: bool,
     pub next_due_at: OffsetDateTime,
     pub fail_count: i32,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChatSettings {
-    pub chat_id: i64,
-    pub locale: Option<String>,
+    /// Paused until the subscriber (or an admin, globally) logs in again.
+    pub needs_login: bool,
 }
 
 #[async_trait::async_trait]
@@ -112,4 +118,27 @@ pub trait Publisher: Send + Sync {
 pub enum PublishError {
     #[error("发送失败: {0}")]
     Failed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips_and_cancelled_is_terminal() {
+        for state in [
+            JobState::Queued,
+            JobState::Extracting,
+            JobState::Downloading,
+            JobState::Processing,
+            JobState::Uploading,
+            JobState::Done,
+            JobState::Failed,
+            JobState::Cancelled,
+        ] {
+            assert_eq!(JobState::parse(state.as_str()), Some(state));
+        }
+        assert!(JobState::Cancelled.is_terminal());
+        assert!(!JobState::Uploading.is_terminal());
+    }
 }

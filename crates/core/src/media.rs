@@ -41,6 +41,8 @@ pub struct YtdlpSpec {
     pub audio_only: bool,
     pub max_height: Option<u32>,
     pub cookies: Option<String>,
+    /// Prefer formats whose known size fits; others are transcoded later.
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -55,6 +57,8 @@ pub enum MediaError {
     Ytdlp(String),
     #[error("下载失败: {0}")]
     Download(String),
+    #[error("文件超过下载上限 {0} 字节")]
+    TooLarge(u64),
     #[error("IO 错误: {0}")]
     Io(String),
 }
@@ -62,6 +66,13 @@ pub enum MediaError {
 #[async_trait::async_trait]
 pub trait Ytdlp: Send + Sync {
     async fn probe_json(&self, url: &Url, cookies: Option<&str>) -> Result<Value, MediaError>;
+    /// Flat playlist/channel listing (`--flat-playlist`), at most `limit` entries.
+    async fn probe_playlist(
+        &self,
+        url: &Url,
+        cookies: Option<&str>,
+        limit: u32,
+    ) -> Result<Value, MediaError>;
     async fn download(&self, url: &Url, dest: &Path, spec: &YtdlpSpec) -> Result<(), MediaError>;
 }
 

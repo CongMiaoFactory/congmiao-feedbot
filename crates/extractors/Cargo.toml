@@ -2,22 +2,20 @@
 name = "feedbot-extractors"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-description = "URL normalization, extractor registry, and site parsers"
+description = "Extractor registry, URL canonicalization, and the reqwest HTTP client"
 
 [dependencies]
 async-trait.workspace = true
-bytes.workspace = true
+feedbot-bilibili.workspace = true
 feedbot-core.workspace = true
-feedbot-media.workspace = true
+feedbot-netease.workspace = true
+feedbot-pixiv.workspace = true
+feedbot-site-common.workspace = true
+feedbot-x.workspace = true
+feedbot-youtube.workspace = true
 http.workspace = true
-image.workspace = true
-qrcode.workspace = true
 reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-time.workspace = true
-tracing.workspace = true
+strsim.workspace = true
 url.workspace = true
-tokio.workspace = true

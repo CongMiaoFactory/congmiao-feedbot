@@ -5,6 +5,7 @@ pub mod extract;
 pub mod job;
 pub mod media;
 pub mod options;
+pub mod present;
 pub mod repo;
 
 pub use auth::{
@@ -12,20 +13,18 @@ pub use auth::{
     Credential, CredentialStatus,
 };
 pub use extract::{
-    Engagement, ExtractCtx, ExtractError, ExtractRequest, Extracted, Extractor, HttpClient,
-    HttpMethod, HttpRequest, HttpResponse, ManifestKind, MediaItem, MediaKind, MediaSource,
-    RequesterInfo, Scope, UgoiraFrame,
+    Engagement, ExtractCtx, ExtractError, ExtractRequest, Extracted, Extractor, ExtractorLookup,
+    FeedEntry, HttpClient, HttpMethod, HttpRequest, HttpResponse, MediaItem, MediaKind,
+    MediaSource, RequesterInfo, Scope, SiteMeta, UgoiraFrame,
 };
-pub use job::{
-    ChatSettings, Job, JobState, MediaCacheEntry, PublishError, Publisher, Subscription,
-    WorkEnqueue,
-};
+pub use job::{Job, JobState, MediaCacheEntry, PublishError, Publisher, Subscription, WorkEnqueue};
 pub use media::{MediaError, MediaInfo, MediaProcessor, TranscodeSpec, Ytdlp, YtdlpSpec};
 pub use options::{
-    fold_fullwidth, merge_layers, parse_tokens, split_option_tokens, OptionDef, OptionDefault,
-    OptionError, OptionKind, OptionSpec, OptionValue, OptionValues,
+    OptionDef, OptionDefault, OptionError, OptionKind, OptionSpec, OptionValue, OptionValues,
+    apply_to_layer, fold_fullwidth, merge_layers, parse_tokens, split_option_tokens,
 };
+pub use present::{Caption, CaptionPage, MediaAction, Present};
 pub use repo::{
-    load_saved_options, CredentialRepo, JobRepo, MediaCacheRepo, SeenRepo, SettingsRepo, Store,
-    StoreError, StoredCredentialMeta, SubscriptionRepo,
+    CachedPage, CredentialRepo, JobRepo, MediaCacheRepo, SeenRepo, SettingsRepo, Store, StoreError,
+    StoredCredentialMeta, SubscriptionRepo, load_saved_options,
 };

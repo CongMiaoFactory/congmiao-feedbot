@@ -1,0 +1,20 @@
+[package]
+name = "feedbot-netease"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NetEase Cloud Music extractor and QR login"
+
+[dependencies]
+async-trait.workspace = true
+feedbot-core.workspace = true
+feedbot-site-common.workspace = true
+http.workspace = true
+serde_json.workspace = true
+time.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+feedbot-site-common = { workspace = true, features = ["testing"] }
+tokio.workspace = true

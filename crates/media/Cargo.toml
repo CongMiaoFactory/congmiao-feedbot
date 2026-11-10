@@ -2,6 +2,7 @@
 name = "feedbot-media"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "FFmpeg CLI media processor and HTTP downloader"
 
@@ -19,7 +20,3 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 zip.workspace = true
-
-[features]
-default = []
-ffmpeg-ffi = []

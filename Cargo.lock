@@ -795,21 +795,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "feedbot-bilibili"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "feedbot-core",
+ "feedbot-site-common",
+ "http",
+ "md-5",
+ "serde_json",
+ "time",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "feedbot-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "bytes",
  "feedbot-core",
  "feedbot-extractors",
  "feedbot-media",
- "feedbot-store",
  "governor",
  "http",
- "reqwest",
- "serde",
  "serde_json",
  "teloxide",
  "tempfile",
@@ -846,19 +857,16 @@ name = "feedbot-extractors"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
+ "feedbot-bilibili",
  "feedbot-core",
- "feedbot-media",
+ "feedbot-netease",
+ "feedbot-pixiv",
+ "feedbot-site-common",
+ "feedbot-x",
+ "feedbot-youtube",
  "http",
- "image",
- "qrcode",
  "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "time",
- "tokio",
- "tracing",
+ "strsim",
  "url",
 ]
 
@@ -866,9 +874,12 @@ dependencies = [
 name = "feedbot-feed"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "feedbot-core",
- "feedbot-extractors",
  "feedbot-store",
+ "futures-util",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",
@@ -898,6 +909,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "feedbot-netease"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "feedbot-core",
+ "feedbot-site-common",
+ "http",
+ "serde_json",
+ "time",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "feedbot-pixiv"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "feedbot-core",
+ "feedbot-site-common",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "feedbot-site-common"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "feedbot-core",
+ "http",
+ "image",
+ "qrcode",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "feedbot-store"
 version = "0.1.0"
 dependencies = [
@@ -909,12 +962,41 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "feedbot-x"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "feedbot-core",
+ "feedbot-site-common",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "feedbot-youtube"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "feedbot-core",
+ "feedbot-site-common",
+ "http",
+ "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]

@@ -3,17 +3,16 @@ use crate::commands::{self, Command};
 use crate::login::{self, LoginDialogue, LoginState};
 use crate::queue::QueuedJob;
 use crate::ui::{self, UiCallback};
-use feedbot_core::JobRepo;
-use feedbot_extractors::canonicalize;
+use feedbot_core::Scope;
+use feedbot_extractors::ExtractorRegistry;
 use std::collections::HashSet;
 use std::sync::Arc;
 use teloxide::dispatching::dialogue::InMemStorage;
-use teloxide::dispatching::{dialogue, UpdateHandler};
+use teloxide::dispatching::{UpdateHandler, dialogue};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SetMessageReactionSetters};
 use teloxide::prelude::*;
 use teloxide::sugar::request::RequestReplyExt;
 use teloxide::types::{ChatAction, ChatKind, MessageEntityKind, ReactionType};
-use uuid::Uuid;
 
 pub fn schema() -> UpdateHandler<anyhow::Error> {
     let command_handler = Update::filter_message()
@@ -79,8 +78,7 @@ async fn handle_callback(
             bot.answer_callback_query(q.id).await.ok();
         }
         UiCallback::Logout(id) => {
-            let (text, kb) =
-                commands::logout_html(&app, &id, user_id, msg.chat.id.0, private).await?;
+            let (text, kb) = commands::logout_html(&app, &id, (Scope::User, user_id)).await?;
             let _ = ui::edit_page(&bot, msg.chat.id, msg.id, text, kb).await;
             bot.answer_callback_query(q.id).await.ok();
         }
@@ -94,7 +92,7 @@ async fn handle_callback(
                 return Ok(());
             }
             bot.answer_callback_query(q.id).await.ok();
-            login::begin(&bot, &msg, app, dialogue, id).await?;
+            login::begin(&bot, &msg, app, dialogue, id, false).await?;
         }
         UiCallback::CancelLogin => {
             let exited = login::abort(&dialogue).await;
@@ -115,11 +113,27 @@ async fn handle_callback(
 }
 
 pub async fn handle_url_message(bot: TgBot, msg: Message, app: Arc<App>) -> anyhow::Result<()> {
-    let urls = dedupe_urls(extract_urls(&msg));
-    if urls.is_empty() {
+    let found = extract_urls(&msg);
+    if found.is_empty() {
         return Ok(());
     }
-    let raw_args = strip_urls(msg.text().unwrap_or(""), &urls);
+    let private = matches!(msg.chat.kind, ChatKind::Private(_));
+    let raw_args = strip_urls(msg.text().unwrap_or(""), &found);
+    // Groups see plenty of unrelated links; only react to supported ones.
+    let urls: Vec<url::Url> =
+        dedupe_urls(&app.registry, found.into_iter().map(|f| f.url).collect())
+            .into_iter()
+            .filter(|u| app.registry.match_url(u).is_some())
+            .collect();
+    if urls.is_empty() {
+        if private {
+            bot.send_message(msg.chat.id, "没有可解析的链接。用 /help 查看支持的平台。")
+                .reply_to(msg.id)
+                .await?;
+        }
+        return Ok(());
+    }
+    let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let _ = bot
         .set_message_reaction(msg.chat.id, msg.id)
         .reaction([ReactionType::Emoji {
@@ -127,28 +141,37 @@ pub async fn handle_url_message(bot: TgBot, msg: Message, app: Arc<App>) -> anyh
         }])
         .await;
     let _ = bot.send_chat_action(msg.chat.id, ChatAction::Typing).await;
+    let mut notice = None;
     for url in urls {
-        let job = QueuedJob {
-            id: Uuid::new_v4(),
-            chat_id: msg.chat.id.0,
-            user_id: msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0),
-            message_id: msg.id.0,
-            url,
-            raw_args: raw_args.clone(),
-        };
-        let rec = crate::queue::job_record(&job);
-        app.store.insert_job(&rec).await?;
-        if app.jobs.enqueue(job).await.is_err() {
-            let _ = bot
-                .send_message(msg.chat.id, "队列已满")
-                .reply_to(msg.id)
-                .await;
+        if app
+            .access
+            .user_limiter
+            .check_key(&(user_id as u64))
+            .is_err()
+        {
+            notice = Some("发送太快了，部分链接已忽略，请稍后再试。");
+            break;
         }
+        let job = QueuedJob::new(msg.chat.id.0, user_id, msg.id.0, url, raw_args.clone());
+        if let Err(e) = app.jobs.submit(job).await {
+            tracing::warn!(error = %e, "enqueue failed");
+            notice = Some("任务队列已满，请稍后再试。");
+            break;
+        }
+    }
+    if let Some(text) = notice {
+        let _ = bot.send_message(msg.chat.id, text).reply_to(msg.id).await;
     }
     Ok(())
 }
 
-fn extract_urls(msg: &Message) -> Vec<url::Url> {
+/// A link found in a message, with the exact text it occupied (if any).
+struct FoundUrl {
+    url: url::Url,
+    raw: Option<String>,
+}
+
+fn extract_urls(msg: &Message) -> Vec<FoundUrl> {
     let mut out = Vec::new();
     let text = msg.text().unwrap_or("");
     if let Some(entities) = msg.entities() {
@@ -156,32 +179,47 @@ fn extract_urls(msg: &Message) -> Vec<url::Url> {
             match &ent.kind {
                 MessageEntityKind::Url => {
                     if let Some(slice) = utf16_slice(text, ent.offset, ent.length) {
-                        if let Ok(u) = url::Url::parse(&slice) {
-                            out.push(u);
+                        // Telegram also marks bare `example.com/x` as URLs.
+                        let url = parse_web_url(&slice)
+                            .or_else(|| parse_web_url(&format!("https://{slice}")));
+                        if let Some(url) = url {
+                            out.push(FoundUrl {
+                                url,
+                                raw: Some(slice),
+                            });
                         }
                     }
                 }
-                MessageEntityKind::TextLink { url } => out.push(url.clone()),
+                MessageEntityKind::TextLink { url } => out.push(FoundUrl {
+                    url: url.clone(),
+                    raw: None,
+                }),
                 _ => {}
             }
         }
     }
     if out.is_empty() {
         for token in text.split_whitespace() {
-            if let Ok(u) = url::Url::parse(token) {
-                if matches!(u.scheme(), "http" | "https") {
-                    out.push(u);
-                }
+            if let Some(url) = parse_web_url(token) {
+                out.push(FoundUrl {
+                    url,
+                    raw: Some(token.to_string()),
+                });
             }
         }
     }
     out
 }
 
-fn dedupe_urls(urls: Vec<url::Url>) -> Vec<url::Url> {
+fn parse_web_url(raw: &str) -> Option<url::Url> {
+    let parsed = url::Url::parse(raw).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then_some(parsed)
+}
+
+fn dedupe_urls(registry: &ExtractorRegistry, urls: Vec<url::Url>) -> Vec<url::Url> {
     let mut seen = HashSet::new();
     urls.into_iter()
-        .filter(|u| seen.insert(canonicalize(u).to_string()))
+        .filter(|u| seen.insert(registry.canonicalize(u).to_string()))
         .collect()
 }
 
@@ -194,10 +232,12 @@ fn utf16_slice(text: &str, offset: usize, length: usize) -> Option<String> {
     String::from_utf16(&utf16[offset..end]).ok()
 }
 
-fn strip_urls(text: &str, urls: &[url::Url]) -> String {
+/// Remove links as they were written (not their normalized form), leaving the
+/// option text around them.
+fn strip_urls(text: &str, found: &[FoundUrl]) -> String {
     let mut rest = text.to_string();
-    for u in urls {
-        rest = rest.replace(u.as_str(), " ");
+    for raw in found.iter().filter_map(|f| f.raw.as_deref()) {
+        rest = rest.replacen(raw, " ", 1);
     }
     rest
 }
@@ -211,16 +251,56 @@ mod tests {
     fn dedupe_music_urls_that_only_differ_by_tracking() {
         let a = Url::parse("https://music.youtube.com/watch?v=jNQXAC9IVRw&si=abc").unwrap();
         let b = Url::parse("https://music.youtube.com/watch?v=jNQXAC9IVRw").unwrap();
-        let out = dedupe_urls(vec![a.clone(), b]);
+        let out = dedupe_urls(&ExtractorRegistry::builtin(), vec![a.clone(), b]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], a);
+    }
+
+    #[test]
+    fn strips_links_as_written() {
+        let found = vec![FoundUrl {
+            url: Url::parse("https://www.pixiv.net/artworks/1").unwrap(),
+            raw: Some("HTTPS://WWW.PIXIV.NET/artworks/1".into()),
+        }];
+        let rest = strip_urls("+q:original HTTPS://WWW.PIXIV.NET/artworks/1 +sp", &found);
+        let (tokens, leftover) = feedbot_core::split_option_tokens(&rest);
+        assert_eq!(tokens, vec!["+q:original", "+sp"]);
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn only_web_schemes_are_links() {
+        assert!(parse_web_url("https://x.com/a/status/1").is_some());
+        assert!(parse_web_url("ftp://x.com/a").is_none());
+        assert!(parse_web_url("+q:original").is_none());
     }
 
     #[test]
     fn keeps_youtube_video_and_music_distinct() {
         let video = Url::parse("https://youtube.com/watch?v=jNQXAC9IVRw").unwrap();
         let music = Url::parse("https://music.youtube.com/watch?v=jNQXAC9IVRw").unwrap();
-        let out = dedupe_urls(vec![video.clone(), music.clone()]);
+        let out = dedupe_urls(
+            &ExtractorRegistry::builtin(),
+            vec![video.clone(), music.clone()],
+        );
         assert_eq!(out, vec![video, music]);
+    }
+
+    #[test]
+    fn dedupe_across_site_host_aliases() {
+        let registry = ExtractorRegistry::builtin();
+        let urls = [
+            "https://youtu.be/jNQXAC9IVRw?si=a",
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+            "https://x.com/a/status/1",
+            "https://twitter.com/a/status/1",
+            "https://b23.tv/BV1xx411c7mD",
+            "https://www.bilibili.com/video/BV1xx411c7mD",
+        ];
+        let out = dedupe_urls(
+            &registry,
+            urls.iter().map(|u| Url::parse(u).unwrap()).collect(),
+        );
+        assert_eq!(out.len(), 3);
     }
 }

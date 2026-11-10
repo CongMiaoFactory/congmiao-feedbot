@@ -1,17 +1,31 @@
-use feedbot_core::Extractor;
+use feedbot_core::{Extractor, ExtractorLookup, HttpClient, Ytdlp};
 use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
-use crate::normalize::canonicalize;
-use crate::sites;
-use crate::sites::bilibili::BilibiliEndpoints;
-use crate::sites::netease::NeteaseEndpoints;
+use feedbot_bilibili::{BilibiliEndpoints, BilibiliExtractor};
+use feedbot_netease::{NeteaseEndpoints, NeteaseExtractor};
+use feedbot_pixiv::PixivExtractor;
+use feedbot_site_common::NoYtdlp;
+use feedbot_x::{XExtractor, XQueryIds};
+use feedbot_youtube::YoutubeExtractor;
 
-#[derive(Debug, Clone, Default)]
+use crate::normalize;
+
+/// Minimum Jaro-Winkler similarity for a fuzzy platform-name match.
+const FUZZY_THRESHOLD: f64 = 0.85;
+
+/// Shared dependencies injected into every site extractor and auth provider.
+#[derive(Clone)]
 pub struct ExtractorSites {
+    pub http: Arc<dyn HttpClient>,
+    pub ytdlp: Arc<dyn Ytdlp>,
     pub bilibili: BilibiliEndpoints,
     pub netease: NeteaseEndpoints,
+    pub x: XQueryIds,
+    /// Largest file the bot can upload; extractors that can choose a quality
+    /// pick one that fits.
+    pub max_upload_bytes: Option<u64>,
 }
 
 pub struct ExtractorRegistry {
@@ -20,51 +34,42 @@ pub struct ExtractorRegistry {
 }
 
 impl ExtractorRegistry {
+    /// Registry with default endpoints and a stand-alone HTTP client, for tests
+    /// and tools. yt-dlp is not available: YouTube extraction fails.
     pub fn builtin() -> Self {
-        Self::with_sites(ExtractorSites::default())
+        Self::with_sites(ExtractorSites {
+            http: crate::default_http(),
+            ytdlp: Arc::new(NoYtdlp),
+            bilibili: BilibiliEndpoints::default(),
+            netease: NeteaseEndpoints::default(),
+            x: XQueryIds::default(),
+            max_upload_bytes: None,
+        })
     }
 
     pub fn with_sites(sites: ExtractorSites) -> Self {
-        let mut reg = Self {
-            extractors: Vec::new(),
-            alias_index: HashMap::new(),
-        };
-        reg.register(Arc::new(sites::pixiv::PixivExtractor));
-        reg.register(Arc::new(sites::x::XExtractor));
-        reg.register(Arc::new(sites::youtube::YoutubeExtractor));
-        reg.register(Arc::new(sites::bilibili::BilibiliExtractor::new(
-            sites.bilibili,
-        )));
-        reg.register(Arc::new(sites::netease::NeteaseExtractor::new(
-            sites.netease,
-        )));
-        reg
-    }
-
-    pub fn register(&mut self, extractor: Arc<dyn Extractor>) {
-        let idx = self.extractors.len();
-        self.index_name(extractor.id(), idx);
-        for alias in extractor.aliases() {
-            self.index_name(alias, idx);
-        }
-        self.extractors.push(extractor);
-        self.extractors
-            .sort_by_key(|e| std::cmp::Reverse(e.priority()));
-        self.rebuild_alias_index();
-    }
-
-    fn index_name(&mut self, name: &str, idx: usize) {
-        self.alias_index.insert(name.to_ascii_lowercase(), idx);
-    }
-
-    fn rebuild_alias_index(&mut self) {
-        self.alias_index.clear();
-        for (idx, extractor) in self.extractors.iter().enumerate() {
-            self.alias_index
-                .insert(extractor.id().to_ascii_lowercase(), idx);
+        let mut extractors: Vec<Arc<dyn Extractor>> = vec![
+            Arc::new(PixivExtractor::new(sites.http.clone())),
+            Arc::new(XExtractor::new(sites.http.clone(), sites.x)),
+            Arc::new(YoutubeExtractor::new(sites.ytdlp)),
+            Arc::new(BilibiliExtractor::new(
+                sites.bilibili,
+                sites.http.clone(),
+                sites.max_upload_bytes,
+            )),
+            Arc::new(NeteaseExtractor::new(sites.netease, sites.http)),
+        ];
+        extractors.sort_by_key(|e| std::cmp::Reverse(e.priority()));
+        let mut alias_index = HashMap::new();
+        for (idx, extractor) in extractors.iter().enumerate() {
+            alias_index.insert(extractor.id().to_ascii_lowercase(), idx);
             for alias in extractor.aliases() {
-                self.alias_index.insert(alias.to_ascii_lowercase(), idx);
+                alias_index.insert(alias.to_ascii_lowercase(), idx);
             }
+        }
+        Self {
+            extractors,
+            alias_index,
         }
     }
 
@@ -76,32 +81,45 @@ impl ExtractorRegistry {
         if let Some(idx) = self.alias_index.get(&key) {
             return self.extractors.get(*idx).cloned();
         }
-        let mut best: Option<(usize, f64)> = None;
-        for (idx, extractor) in self.extractors.iter().enumerate() {
-            let score = strsim_score(&key, extractor.id());
-            if score >= 0.78 && best.map(|(_, s)| score > s).unwrap_or(true) {
-                best = Some((idx, score));
-            }
-            for alias in extractor.aliases() {
-                let s = strsim_score(&key, alias);
-                if s >= 0.78 && best.map(|(_, prev)| s > prev).unwrap_or(true) {
-                    best = Some((idx, s));
-                }
-            }
-        }
-        best.map(|(idx, _)| self.extractors[idx].clone())
+        self.alias_index
+            .iter()
+            .map(|(alias, idx)| (strsim::jaro_winkler(&key, alias), *idx))
+            .filter(|(score, _)| *score >= FUZZY_THRESHOLD)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, idx)| self.extractors[idx].clone())
     }
 
     pub fn suggest_name(&self, name: &str) -> Option<String> {
         self.resolve_name(name).map(|e| e.id().to_string())
     }
 
+    /// Canonical form of `url`: lowercase host, the owning site's
+    /// [`Extractor::rewrite_url`], no tracking parameters. Used for matching,
+    /// de-duplication, and stored subscription sources.
+    pub fn canonicalize(&self, url: &Url) -> Url {
+        normalize::canonicalize(url, &self.extractors)
+    }
+
     pub fn match_url(&self, url: &Url) -> Option<Arc<dyn Extractor>> {
-        let canonical = canonicalize(url);
+        let canonical = self.canonicalize(url);
         self.extractors
             .iter()
             .find(|e| e.matches(&canonical) || e.matches(url))
             .cloned()
+    }
+
+    /// Extractor that can poll `url` as a subscription source.
+    pub fn match_feed(&self, url: &Url) -> Option<Arc<dyn Extractor>> {
+        let canonical = self.canonicalize(url);
+        self.extractors
+            .iter()
+            .find(|e| e.feed_matches(&canonical) || e.feed_matches(url))
+            .cloned()
+    }
+
+    /// Exact match on [`Extractor::id`]; use for ids read back from storage.
+    pub fn by_id(&self, id: &str) -> Option<Arc<dyn Extractor>> {
+        self.extractors.iter().find(|e| e.id() == id).cloned()
     }
 
     pub fn all(&self) -> &[Arc<dyn Extractor>] {
@@ -109,21 +127,98 @@ impl ExtractorRegistry {
     }
 }
 
-fn strsim_score(a: &str, b: &str) -> f64 {
-    // local jaro-winkler-ish via core's strsim is not re-exported; simple ratio:
-    if a == b {
-        return 1.0;
+impl ExtractorLookup for ExtractorRegistry {
+    fn by_id(&self, id: &str) -> Option<Arc<dyn Extractor>> {
+        ExtractorRegistry::by_id(self, id)
     }
-    let mut same = 0usize;
-    for (ca, cb) in a.chars().zip(b.chars()) {
-        if ca == cb {
-            same += 1;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn by_id_is_exact() {
+        let registry = ExtractorRegistry::builtin();
+        for e in registry.all() {
+            assert_eq!(registry.by_id(e.id()).map(|f| f.id()), Some(e.id()));
+        }
+        // Aliases and near-misses resolve by name, but never by id.
+        assert!(registry.resolve_name("pixi").is_some());
+        assert!(registry.by_id("pixi").is_none());
+        assert!(registry.by_id("Pixiv").is_none());
+        assert!(registry.by_id("").is_none());
+    }
+
+    #[test]
+    fn canonicalize_uses_site_rewrites() {
+        let registry = ExtractorRegistry::builtin();
+        let canon = |s: &str| registry.canonicalize(&Url::parse(s).unwrap()).to_string();
+        assert_eq!(
+            canon("https://youtu.be/abc123?si=1&t=5"),
+            "https://youtube.com/watch?v=abc123&t=5"
+        );
+        assert_eq!(
+            canon("https://music.youtube.com/watch?v=abc&si=xx"),
+            "https://music.youtube.com/watch?v=abc"
+        );
+        assert_eq!(
+            canon("https://X.com/foo/status/1?utm_source=t"),
+            "https://twitter.com/foo/status/1"
+        );
+        assert_eq!(
+            canon("https://www.pixiv.net/artworks/1"),
+            "https://pixiv.net/artworks/1"
+        );
+        assert_eq!(
+            canon("https://b23.tv/BV1xx411c7mD?share_source=copy"),
+            "https://bilibili.com/video/BV1xx411c7mD"
+        );
+        // Opaque short codes need a request; `extract` expands them.
+        assert_eq!(canon("https://b23.tv/AbCdEf1"), "https://b23.tv/AbCdEf1");
+        assert_eq!(
+            canon("https://example.com/a?z=1"),
+            "https://example.com/a?z=1"
+        );
+    }
+
+    #[test]
+    fn multibyte_path_segments_do_not_panic() {
+        let registry = ExtractorRegistry::builtin();
+        for s in [
+            "https://www.bilibili.com/video/中文",
+            "https://www.bilibili.com/bangumi/play/中文",
+            "https://b23.tv/中文",
+        ] {
+            let url = Url::parse(s).unwrap();
+            let _ = registry.canonicalize(&url);
+            let _ = registry.match_url(&url);
         }
     }
-    let max = a.len().max(b.len()) as f64;
-    if max == 0.0 {
-        0.0
-    } else {
-        same as f64 / max
+
+    #[test]
+    fn names_and_feeds_resolve_to_sites() {
+        let registry = ExtractorRegistry::builtin();
+        for (id, names) in [
+            ("youtube", &["youtube", "yt", "ytb", "ytbm"][..]),
+            ("netease", &["netease", "ncm", "163", "网易云"]),
+            ("bilibili", &["bilibili", "bili", "b站"]),
+            ("pixiv", &["pixiv", "px"]),
+            ("x", &["x", "twitter", "tw"]),
+        ] {
+            for name in names {
+                assert_eq!(
+                    registry.resolve_name(name).map(|e| e.id()),
+                    Some(id),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(
+            registry
+                .match_feed(&Url::parse("https://m.bilibili.com/space/1").unwrap())
+                .map(|e| e.id()),
+            Some("bilibili")
+        );
     }
 }

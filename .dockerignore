@@ -1,0 +1,13 @@
+# Build output and local state never go into the build context.
+/target
+/data
+.env
+*.db
+*.db-wal
+*.db-shm
+master.key
+.git
+.idea
+.vscode
+*.swp
+.DS_Store

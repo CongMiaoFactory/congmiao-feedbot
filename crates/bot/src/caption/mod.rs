@@ -1,19 +1,13 @@
-//! Per-site caption layouts plus a shared UTF-16 HTML layout engine.
+//! Renders the platform-agnostic caption blocks of `feedbot_core::present`
+//! as Telegram HTML within the UTF-16 limits, and actions as buttons.
 
-mod blocks;
-mod default;
-mod pixiv;
-mod stats;
-mod x;
-mod youtube;
-mod bilibili;
-mod netease;
+#[cfg(test)]
+mod tests;
 
 use feedbot_core::Extracted;
-use teloxide::types::InlineKeyboardMarkup;
+use feedbot_core::present::{self, Block, CaptionPage, MediaAction, Present, Span};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use teloxide::utils::html;
-
-use blocks::{Block, Span};
 
 pub const CAPTION_LIMIT: usize = 1024;
 pub const TEXT_LIMIT: usize = 4096;
@@ -25,43 +19,24 @@ pub struct RenderedText {
     pub extras: Vec<String>,
 }
 
-/// 0-based index of the first item in a send group, plus how many items are being sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CaptionPage {
-    pub index: usize,
-    pub total: usize,
+/// Caption of the send group starting at `page.index`, in the site's layout.
+pub fn build_caption_page(
+    present: Present,
+    extracted: &Extracted,
+    page: CaptionPage,
+) -> RenderedText {
+    render_blocks(present::blocks(present, extracted, page))
 }
 
-pub fn build_caption(extracted: &Extracted) -> RenderedText {
-    build_caption_page(
-        extracted,
-        CaptionPage {
-            index: 0,
-            total: extracted.items.len(),
-        },
-    )
-}
-
-pub fn build_caption_page(extracted: &Extracted, page: CaptionPage) -> RenderedText {
-    let blocks = match extracted.extractor_id.as_str() {
-        "pixiv" => pixiv::blocks(extracted, page),
-        "x" => x::blocks(extracted, page),
-        "youtube" => youtube::blocks(extracted, page),
-        "bilibili" => bilibili::blocks(extracted, page),
-        "netease" => netease::blocks(extracted, page),
-        _ => default::blocks(extracted),
-    };
-    render_blocks(blocks)
-}
-
-pub fn media_keyboard(extracted: &Extracted) -> Option<InlineKeyboardMarkup> {
-    match extracted.extractor_id.as_str() {
-        "x" => x::link_keyboard(extracted),
-        "youtube" => youtube::link_keyboard(extracted),
-        "bilibili" => bilibili::link_keyboard(extracted),
-        "netease" => netease::link_keyboard(extracted),
-        _ => None,
-    }
+/// The layout's link buttons (e.g. "作者" / "原帖") for single-media posts.
+pub fn media_keyboard(present: Present, extracted: &Extracted) -> Option<InlineKeyboardMarkup> {
+    let row: Vec<InlineKeyboardButton> = present::actions(present, extracted)
+        .into_iter()
+        .map(|action| match action {
+            MediaAction::Url { label, href } => InlineKeyboardButton::url(label, href),
+        })
+        .collect();
+    (!row.is_empty()).then(|| InlineKeyboardMarkup::new(vec![row]))
 }
 
 fn render_blocks(blocks: Vec<Block>) -> RenderedText {
@@ -285,9 +260,8 @@ fn chunk_escaped(text: &str, limit: usize) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod render_tests {
     use super::*;
-    use blocks::{Block, Span};
 
     #[test]
     fn emoji_counts_as_two_utf16_units() {

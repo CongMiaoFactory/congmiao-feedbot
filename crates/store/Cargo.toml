@@ -2,6 +2,7 @@
 name = "feedbot-store"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "SQLite repositories for jobs, cache, subscriptions, and credentials"
 
@@ -20,3 +21,6 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

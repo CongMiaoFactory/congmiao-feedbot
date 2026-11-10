@@ -2,6 +2,7 @@
 name = "feedbot-bot"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Telegram transport, commands, login dialogue, and worker pool"
 
@@ -9,15 +10,11 @@ description = "Telegram transport, commands, login dialogue, and worker pool"
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
-bytes.workspace = true
 feedbot-core.workspace = true
 feedbot-extractors.workspace = true
 feedbot-media.workspace = true
-feedbot-store.workspace = true
 governor.workspace = true
 http.workspace = true
-reqwest.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 teloxide.workspace = true
 thiserror.workspace = true

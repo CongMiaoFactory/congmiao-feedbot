@@ -1,6 +1,7 @@
 [telegram]
 api_url = "https://api.telegram.org"
 admin_ids = []
+# "polling" or "webhook"
 mode = "polling"
 
 [telegram.polling]
@@ -17,15 +18,32 @@ drop_pending = true
 extract_permits = 8
 media_permits = 2
 per_user_per_minute = 10
-progress_edit_interval_secs = 3
 max_attempts = 3
+# Jobs processed at the same time; further jobs wait in the queue
+max_jobs = 4
 
 [output]
 album_max = 10
 summary_threshold = 20
 max_upload_bytes = 52428800
 max_photo_bytes = 10485760
+# More than summary_threshold items: "chunk" sends every item in albums;
+# "telegraph" publishes a photo set as one telegra.ph page and sends only the
+# link (falls back to chunk when an image cannot be hotlinked, see [telegraph])
 overflow = "chunk"
+# Hard cap for one downloaded file before transcoding (2 GiB)
+max_download_bytes = 2147483648
+
+[telegraph]
+api_base = "https://api.telegra.ph"
+# Secret: set FEEDBOT__TELEGRAPH__ACCESS_TOKEN to keep pages under one account.
+# Empty: a new account is created on first use after every start.
+access_token = ""
+author_name = "CongMiaoFeedBot"
+# Telegraph cannot upload images, so pages link the originals. Hosts that need
+# a Referer/Cookie (Pixiv, Bilibili) only work through a proxy host, e.g.
+# ["i.pximg.net=i.pixiv.re"] (third-party). Without one they fall back to chunk.
+image_proxies = []
 
 [database]
 path = "data/feedbot.db"
@@ -33,9 +51,15 @@ path = "data/feedbot.db"
 [ffmpeg]
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
+timeout_secs = 1800
 
 [ytdlp]
 bin = "yt-dlp"
+download_timeout_secs = 1800
+# JavaScript runtime for YouTube, as yt-dlp's `--js-runtimes RUNTIME[:PATH]`
+# (deno, node, quickjs, bun). Empty uses yt-dlp's default, Deno. The Docker
+# image sets "quickjs".
+js_runtime = ""
 
 [http]
 user_agent = "CongMiaoFeedBot/0.1"
@@ -45,6 +69,13 @@ connect_timeout_secs = 10
 [feed]
 tick_secs = 30
 max_fail_count = 8
+sub_interval_secs = 3600
+push_limit = 10
+# Subscriptions polled at the same time in one tick
+poll_concurrency = 4
+poll_timeout_secs = 120
+credential_check_secs = 21600
+job_retention_days = 7
 
 [log]
 format = "pretty"
@@ -56,6 +87,14 @@ live_api_base = "https://api.live.bilibili.com"
 
 [netease]
 api_base = "http://127.0.0.1:3000"
+
+[x]
+# GraphQL query ids of the x.com web client. They rotate: when X calls fail
+# with "GraphQL 404", copy the current ids from gallery-dl's
+# extractor/twitter.py, e.g. FEEDBOT__X__USER_MEDIA=...
+tweet_result_by_rest_id = "qxWQxcMLiTPcavz9Qy5hwQ"
+user_by_screen_name = "ck5KkZ8t5cOmoLssopN99Q"
+user_media = "jCRhbOzdgOHp6u9H4g2tEg"
 
 [secrets]
 # Leave empty to auto-generate data/master.key on first run.

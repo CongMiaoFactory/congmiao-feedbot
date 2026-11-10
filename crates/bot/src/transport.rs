@@ -1,6 +1,6 @@
 use crate::app::TgBot;
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use std::net::SocketAddr;
 use std::time::Duration;
 use teloxide::dispatching::{DefaultKey, Dispatcher};
@@ -8,7 +8,7 @@ use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::payloads::DeleteWebhookSetters;
 use teloxide::requests::Requester;
 use teloxide::types::AllowedUpdate;
-use teloxide::update_listeners::{webhooks, Polling};
+use teloxide::update_listeners::{Polling, webhooks};
 use url::Url;
 
 #[derive(Debug, Clone)]

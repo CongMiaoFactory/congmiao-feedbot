@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 use url::Url;
 
@@ -19,14 +20,64 @@ const GOOGLE_COOKIE_NAMES: &[&str] = &[
     "NID",
 ];
 
+const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(90);
+const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Clone)]
 pub struct YtdlpCli {
     bin: PathBuf,
+    download_timeout: Duration,
+    /// `RUNTIME[:PATH]` for `--js-runtimes`; `None` keeps yt-dlp's default (Deno).
+    js_runtime: Option<String>,
 }
 
 impl YtdlpCli {
     pub fn new(bin: impl Into<PathBuf>) -> Self {
-        Self { bin: bin.into() }
+        Self {
+            bin: bin.into(),
+            download_timeout: DEFAULT_DOWNLOAD_TIMEOUT,
+            js_runtime: None,
+        }
+    }
+
+    /// Use only `runtime` (`RUNTIME[:PATH]`, e.g. `quickjs`) for YouTube's
+    /// JavaScript challenges. Empty keeps yt-dlp's default.
+    pub fn with_js_runtime(mut self, runtime: &str) -> Self {
+        let runtime = runtime.trim();
+        self.js_runtime = (!runtime.is_empty()).then(|| runtime.to_string());
+        self
+    }
+
+    /// Leading arguments of every call: no user config, no warnings, and the
+    /// configured JavaScript runtime.
+    fn base_args(&self) -> Vec<String> {
+        let mut args = vec!["--ignore-config".to_string(), "--no-warnings".to_string()];
+        if let Some(runtime) = &self.js_runtime {
+            args.extend([
+                "--no-js-runtimes".into(),
+                "--js-runtimes".into(),
+                runtime.clone(),
+            ]);
+        }
+        args
+    }
+
+    pub fn with_download_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.download_timeout = timeout;
+        }
+        self
+    }
+
+    fn cookie_args(cookie_file: Option<&tempfile::TempPath>) -> Result<Vec<String>, MediaError> {
+        let Some(path) = cookie_file else {
+            return Ok(Vec::new());
+        };
+        let path = path
+            .to_str()
+            .ok_or_else(|| MediaError::Io("cookies 路径无效".into()))?;
+        Ok(vec!["--cookies".into(), path.to_string()])
     }
 
     fn map_spawn(err: std::io::Error) -> MediaError {
@@ -37,24 +88,17 @@ impl YtdlpCli {
         }
     }
 
-    async fn run(
-        &self,
-        args: &[String],
-        timeout: Option<std::time::Duration>,
-    ) -> Result<String, MediaError> {
+    async fn run(&self, args: &[String], timeout: Duration) -> Result<String, MediaError> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = match timeout {
-            Some(limit) => tokio::time::timeout(limit, cmd.output())
-                .await
-                .map_err(|_| MediaError::Ytdlp("yt-dlp 超时".into()))?
-                .map_err(Self::map_spawn)?,
-            None => cmd.output().await.map_err(Self::map_spawn)?,
-        };
+        let output = tokio::time::timeout(timeout, cmd.output())
+            .await
+            .map_err(|_| MediaError::Ytdlp("yt-dlp 超时".into()))?
+            .map_err(Self::map_spawn)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -139,34 +183,56 @@ impl Ytdlp for YtdlpCli {
             .filter(|s| !s.trim().is_empty())
             .map(write_cookies_file)
             .transpose()?;
-        let mut args: Vec<String> = [
-            "--ignore-config",
-            "--no-warnings",
-            "--no-playlist",
-            "--skip-download",
-            "--retries",
-            "1",
-            "--extractor-retries",
-            "1",
-            "--socket-timeout",
-            "15",
-            "-J",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-        if let Some(path) = cookie_file.as_ref() {
-            args.push("--cookies".into());
-            args.push(
-                path.to_str()
-                    .ok_or_else(|| MediaError::Io("cookies 路径无效".into()))?
-                    .to_string(),
-            );
-        }
+        let mut args = self.base_args();
+        args.extend(
+            [
+                "--no-playlist",
+                "--skip-download",
+                "--retries",
+                "1",
+                "--extractor-retries",
+                "1",
+                "--socket-timeout",
+                "15",
+                "-J",
+            ]
+            .map(str::to_string),
+        );
+        args.extend(Self::cookie_args(cookie_file.as_ref())?);
         args.push(url.as_str().to_string());
-        let stdout = self
-            .run(&args, Some(std::time::Duration::from_secs(45)))
-            .await?;
+        let stdout = self.run(&args, PROBE_TIMEOUT).await?;
+        drop(cookie_file);
+        json_from_stdout(&stdout)
+    }
+
+    async fn probe_playlist(
+        &self,
+        url: &Url,
+        cookies: Option<&str>,
+        limit: u32,
+    ) -> Result<Value, MediaError> {
+        let cookie_file = cookies
+            .filter(|s| !s.trim().is_empty())
+            .map(write_cookies_file)
+            .transpose()?;
+        let mut args = self.base_args();
+        args.extend(
+            [
+                "--flat-playlist",
+                "--skip-download",
+                "--extractor-retries",
+                "1",
+                "--socket-timeout",
+                "15",
+                "--playlist-end",
+            ]
+            .map(str::to_string),
+        );
+        args.push(limit.max(1).to_string());
+        args.push("-J".into());
+        args.extend(Self::cookie_args(cookie_file.as_ref())?);
+        args.push(url.as_str().to_string());
+        let stdout = self.run(&args, PLAYLIST_TIMEOUT).await?;
         drop(cookie_file);
         json_from_stdout(&stdout)
     }
@@ -185,37 +251,24 @@ impl Ytdlp for YtdlpCli {
             .to_str()
             .ok_or_else(|| MediaError::Io("下载路径无效".into()))?
             .to_string();
-        let height = spec.max_height.unwrap_or(1080);
-        let format = if spec.audio_only {
-            "bestaudio/best".to_string()
-        } else {
-            format!("bv*[height<={height}]+ba/b[height<={height}]/b")
-        };
-        let mut args: Vec<String> = vec![
-            "--ignore-config".into(),
-            "--no-warnings".into(),
+        let format = format_selector(spec);
+        let mut args = self.base_args();
+        args.extend([
             "--no-playlist".into(),
             "--newline".into(),
             "-f".into(),
             format,
             "-o".into(),
             tmpl_s,
-        ];
+        ]);
         if spec.audio_only {
             args.extend(["-x".into(), "--audio-format".into(), "m4a".into()]);
         } else {
             args.extend(["--merge-output-format".into(), "mp4".into()]);
         }
-        if let Some(path) = cookie_file.as_ref() {
-            args.push("--cookies".into());
-            args.push(
-                path.to_str()
-                    .ok_or_else(|| MediaError::Io("cookies 路径无效".into()))?
-                    .to_string(),
-            );
-        }
+        args.extend(Self::cookie_args(cookie_file.as_ref())?);
         args.push(url.as_str().to_string());
-        self.run(&args, None).await?;
+        self.run(&args, self.download_timeout).await?;
         drop(cookie_file);
         if dest.exists() {
             return Ok(());
@@ -239,9 +292,68 @@ impl Ytdlp for YtdlpCli {
     }
 }
 
+/// `-f` selector. With a size limit, formats whose known size fits come
+/// first (the video part keeps room for audio); the plain rule follows, and
+/// what is still too large gets transcoded.
+fn format_selector(spec: &YtdlpSpec) -> String {
+    if spec.audio_only {
+        return "bestaudio/best".into();
+    }
+    let h = spec.max_height.unwrap_or(1080);
+    let plain = format!("bv*[height<={h}]+ba/b[height<={h}]/b");
+    match spec.max_bytes {
+        Some(max) => {
+            let total = max / 10 * 9;
+            let video = total / 100 * 85;
+            format!(
+                "bv*[height<={h}][filesize_approx<={video}]+ba/b[height<={h}][filesize_approx<={total}]/{plain}"
+            )
+        }
+        None => plain,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn js_runtime_replaces_default() {
+        let plain = YtdlpCli::new("yt-dlp").with_js_runtime("  ");
+        assert_eq!(plain.base_args(), ["--ignore-config", "--no-warnings"]);
+        let quickjs = YtdlpCli::new("yt-dlp").with_js_runtime("quickjs:/usr/local/bin/qjs");
+        assert_eq!(
+            quickjs.base_args(),
+            [
+                "--ignore-config",
+                "--no-warnings",
+                "--no-js-runtimes",
+                "--js-runtimes",
+                "quickjs:/usr/local/bin/qjs"
+            ]
+        );
+    }
+
+    #[test]
+    fn format_prefers_fitting_sizes() {
+        let mut spec = YtdlpSpec {
+            audio_only: false,
+            max_height: Some(720),
+            cookies: None,
+            max_bytes: None,
+        };
+        assert_eq!(
+            format_selector(&spec),
+            "bv*[height<=720]+ba/b[height<=720]/b"
+        );
+        spec.max_bytes = Some(50_000_000);
+        assert_eq!(
+            format_selector(&spec),
+            "bv*[height<=720][filesize_approx<=38250000]+ba/b[height<=720][filesize_approx<=45000000]/bv*[height<=720]+ba/b[height<=720]/b"
+        );
+        spec.audio_only = true;
+        assert_eq!(format_selector(&spec), "bestaudio/best");
+    }
 
     #[test]
     fn cookie_header_to_netscape() {

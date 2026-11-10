@@ -101,6 +101,32 @@ pub enum CredentialStatus {
     Unknown,
 }
 
+impl CredentialStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Expired => "expired",
+            Self::Invalid => "invalid",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Unrecognized stored values read as `Unknown`.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "valid" => Self::Valid,
+            "expired" => Self::Expired,
+            "invalid" => Self::Invalid,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The user has to log in again; periodic checks skip such credentials.
+    pub fn needs_login(self) -> bool {
+        matches!(self, Self::Expired | Self::Invalid)
+    }
+}
+
 /// Opaque login session state owned by the platform implementation.
 #[derive(Debug, Clone, Default)]
 pub struct AuthSession {
